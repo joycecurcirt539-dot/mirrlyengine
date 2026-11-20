@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/assets/logo.png" alt="MirrlyEngine Logo" width="220" />
+
 # mirrlyengine
 
 **Универсальное нативное прокси-ядро на Rust (`Tokio`, `rustls`, `ring`) для `Windows`, `Linux`, `macOS`, `iOS` и `Android` с поддержкой `SOCKS5`, `MTProto FakeTLS`, Anycast CDN ([Flowseal](https://github.com/Flowseal)) и Cloudflare Worker `WSS`**
@@ -177,6 +179,9 @@ mirrlyengine/
 │   └── config.toml                # Флаги линковки Android (16 KB alignment + build-id)
 ├── .github/
 │   └── workflows/ci.yml           # Кросс-платформенный CI (Windows, Linux, macOS, iOS, Android)
+├── docs/
+│   └── assets/
+│       └── logo.png               # Логотип проекта для README
 ├── include/
 │   ├── mirrlyengine.h             # Заголовок C / C++ / Swift для C-FFI
 │   └── module.modulemap           # Описание модуля Apple для XCFramework
