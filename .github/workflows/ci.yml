@@ -1,0 +1,97 @@
+name: Cross-Platform CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Run unit and integration tests
+        run: cargo test --locked --all-features
+      - name: Build release cdylib/staticlib/rlib
+        run: cargo build --locked --release
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Run unit and integration tests
+        run: cargo test --locked --all-features
+      - name: Build release cdylib/staticlib/rlib
+        run: cargo build --locked --release
+      - name: Verify C header compiles against C compiler
+        run: cc -std=c99 -fsyntax-only -Iinclude include/mirrlyengine.h
+      - name: Check Linux ARM64 cross-compilation
+        run: cargo check --locked --target aarch64-unknown-linux-gnu
+
+  macos-and-ios:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+      - name: Run macOS unit and integration tests
+        run: cargo test --locked --all-features
+      - name: Build macOS release libraries
+        run: cargo build --locked --release --target aarch64-apple-darwin
+      - name: Build iOS staticlibs and package XCFramework
+        run: |
+          cargo build --locked --release --target aarch64-apple-ios
+          cargo build --locked --release --target aarch64-apple-ios-sim
+          cargo build --locked --release --target x86_64-apple-ios
+          mkdir -p target/ios-sim-universal/release
+          lipo -create \
+            target/aarch64-apple-ios-sim/release/libmirrlyengine.a \
+            target/x86_64-apple-ios/release/libmirrlyengine.a \
+            -output target/ios-sim-universal/release/libmirrlyengine.a
+          xcodebuild -create-xcframework \
+            -library target/aarch64-apple-ios/release/libmirrlyengine.a -headers include \
+            -library target/ios-sim-universal/release/libmirrlyengine.a -headers include \
+            -output target/MirrlyEngine.xcframework
+      - name: Verify C/Obj-C header syntax
+        run: clang -std=c99 -fsyntax-only -Iinclude include/mirrlyengine.h
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Android cdylibs with 16 KiB page alignment
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 --platform 23 -o target/jniLibs build --locked --release
+      - name: Verify 16 KiB ELF LOAD alignment on 64-bit ABIs
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          for abi in arm64-v8a x86_64; do
+            align=$("$NDK_BIN/llvm-readelf" -lW "target/jniLibs/$abi/libmirrlyengine.so" | awk '/LOAD/ {print $NF}' | sort -u)
+            echo "$abi alignment: $align"
+            echo "$align" | grep -q "0x4000"
+          done

@@ -3,14 +3,15 @@ name = "mirrlyengine"
 version = "1.0.0"
 edition = "2021"
 authors = ["R1Xern (Mirrly Dev)"]
-description = "Mirrly TG Proxy - High Performance Native MTProto & WebSocket Engine"
+description = "Mirrly Engine - Cross-Platform Native MTProto & SOCKS5 Cloudflare Proxy Core"
 
 [lib]
 name = "mirrlyengine"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 [features]
 heartbeat-test-utils = []
+jni = []
 
 [dependencies]
 tokio = { version = "1.40", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }

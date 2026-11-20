@@ -14,7 +14,7 @@ pub mod recovery;
 pub mod socks5;
 pub mod tls_observability;
 pub mod ws;
-pub mod traffic_guard;
+pub mod platform;
 
 pub use cfproxy::ProtoScope;
 
@@ -25,10 +25,10 @@ use proxy::{run_proxy, WsPool};
 use socks5::run_socks5_server;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_int};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::raw::{c_char, c_int, c_void};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 
@@ -36,6 +36,9 @@ static RUNTIME: OnceCell<Runtime> = OnceCell::new();
 static ENGINE_STARTED_AT: OnceCell<Instant> = OnceCell::new();
 static MTPROTO_RUNNING: AtomicBool = AtomicBool::new(false);
 static SOCKS5_RUNNING: AtomicBool = AtomicBool::new(false);
+static MTPROTO_LISTEN_PORT: AtomicU16 = AtomicU16::new(0);
+static SOCKS5_LISTEN_PORT: AtomicU16 = AtomicU16::new(0);
+static REQUESTED_RUNTIME_THREADS: AtomicUsize = AtomicUsize::new(0);
 
 fn mark_engine_started() {
     ENGINE_STARTED_AT.get_or_init(Instant::now);
@@ -62,10 +65,22 @@ pub fn build_stats_json() -> String {
         "pool_misses": STATS.pool_misses.load(Ordering::Relaxed),
         "uptime_secs": engine_uptime_secs(),
         "tls_enabled": ws::is_tls_enabled(),
-        "mtproto_running": MTPROTO_RUNNING.load(Ordering::Relaxed),
-        "socks5_running": SOCKS5_RUNNING.load(Ordering::Relaxed),
+        "mtproto_running": MTPROTO_RUNNING.load(Ordering::Acquire),
+        "socks5_running": SOCKS5_RUNNING.load(Ordering::Acquire),
+        "mtproto_port": MTPROTO_LISTEN_PORT.load(Ordering::Acquire),
+        "socks5_port": SOCKS5_LISTEN_PORT.load(Ordering::Acquire),
     })
     .to_string()
+}
+
+struct ListenerDoneSignal(Option<std::sync::mpsc::SyncSender<()>>);
+
+impl Drop for ListenerDoneSignal {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.try_send(());
+        }
+    }
 }
 
 struct MtprotoState {
@@ -73,12 +88,14 @@ struct MtprotoState {
     handle: tokio::task::JoinHandle<()>,
     cancel_tasks: CancellationToken,
     cancel_sessions: Arc<parking_lot::RwLock<CancellationToken>>,
+    done_rx: std::sync::mpsc::Receiver<()>,
 }
 
 struct Socks5State {
     handle: tokio::task::JoinHandle<()>,
     cancel_tasks: CancellationToken,
     cancel_sessions: Arc<parking_lot::RwLock<CancellationToken>>,
+    done_rx: std::sync::mpsc::Receiver<()>,
 }
 
 static MTPROTO_STATE: OnceCell<Mutex<Option<MtprotoState>>> = OnceCell::new();
@@ -92,55 +109,60 @@ fn socks5_state_cell() -> &'static Mutex<Option<Socks5State>> {
     SOCKS5_STATE.get_or_init(|| Mutex::new(None))
 }
 
-pub(crate) fn bind_reuse_tcp(addr: &str) -> std::io::Result<tokio::net::TcpListener> {
-    let sock_addr: std::net::SocketAddr = addr
-        .parse()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let domain = if sock_addr.is_ipv6() {
-        socket2::Domain::IPV6
-    } else {
-        socket2::Domain::IPV4
-    };
-    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-    let _ = socket.set_reuse_address(true);
-    #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
-    {
-        let _ = socket.set_reuse_port(true);
+fn abort_and_wait_listener_drop(
+    handle: tokio::task::JoinHandle<()>,
+    cancel_tasks: CancellationToken,
+    done_rx: std::sync::mpsc::Receiver<()>,
+) {
+    cancel_tasks.cancel();
+    handle.abort();
+    // Only wait synchronously when called outside a Tokio runtime worker thread.
+    if tokio::runtime::Handle::try_current().is_err() {
+        let _ = done_rx.recv_timeout(Duration::from_millis(500));
     }
-    socket.set_nonblocking(true)?;
-    socket.bind(&sock_addr.into())?;
-    socket.listen(1024)?;
-    let std_listener: std::net::TcpListener = socket.into();
-    tokio::net::TcpListener::from_std(std_listener)
+}
+
+fn map_bind_error(err_kind: std::io::ErrorKind) -> c_int {
+    if err_kind == std::io::ErrorKind::AddrInUse {
+        -1
+    } else {
+        -2
+    }
 }
 
 fn init_crypto_and_panic_hook() {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    static PANIC_HOOK_SET: OnceCell<()> = OnceCell::new();
-    PANIC_HOOK_SET.get_or_init(|| {
-        std::panic::set_hook(Box::new(|info| {
-            crate::lerror!("RUST ENGINE PANIC: {}", info);
-        }));
-    });
-    traffic_guard::ensure_traffic_guard_audited();
+    if !std::thread::panicking() {
+        static PANIC_HOOK_SET: OnceCell<()> = OnceCell::new();
+        PANIC_HOOK_SET.get_or_init(|| {
+            std::panic::set_hook(Box::new(|info| {
+                crate::lerror!("RUST ENGINE PANIC: {}", info);
+            }));
+        });
+    }
+}
+
+fn effective_runtime_worker_threads() -> usize {
+    let requested = REQUESTED_RUNTIME_THREADS.load(Ordering::Acquire);
+    if requested > 0 {
+        return requested.clamp(1, 16);
+    }
+    let (min_threads, max_threads) = platform::default_runtime_thread_bounds();
+    let detected_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(min_threads);
+    detected_cores.clamp(min_threads, max_threads)
 }
 
 pub(crate) fn runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
         init_crypto_and_panic_hook();
 
-        // Dynamically size worker threads based on available CPU cores:
-        // Lower bound 4: prevents reactor starvation during concurrent crypto & blocking I/O
-        // Upper bound 8: optimizes battery & thermal efficiency on ARM big.LITTLE architectures
-        let detected_cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        let worker_threads = detected_cores.clamp(4, 8);
+        let worker_threads = effective_runtime_worker_threads();
 
         crate::linfo!(
-            "Tokio multi-thread runtime initialized: {} worker threads (detected {} CPU cores)",
-            worker_threads,
-            detected_cores
+            "Tokio multi-thread runtime initialized: {} worker threads",
+            worker_threads
         );
 
         tokio::runtime::Builder::new_multi_thread()
@@ -173,6 +195,10 @@ pub unsafe extern "C" fn StartProxy(
     c_secret: *const c_char,
     verbose: c_int,
 ) -> c_int {
+    if port < 0 || port > u16::MAX as c_int {
+        return -2;
+    }
+
     init_crypto_and_panic_hook();
 
     let cell = mtproto_state_cell();
@@ -180,9 +206,9 @@ pub unsafe extern "C" fn StartProxy(
 
     if let Some(old_state) = guard.take() {
         MTPROTO_RUNNING.store(false, Ordering::Release);
+        MTPROTO_LISTEN_PORT.store(0, Ordering::Release);
         crate::linfo!("StartProxy: taking down previous active MTProto state before restart");
-        old_state.cancel_tasks.cancel();
-        old_state.handle.abort();
+        abort_and_wait_listener_drop(old_state.handle, old_state.cancel_tasks, old_state.done_rx);
     }
 
     generation_guard::change_config(|| {});
@@ -214,8 +240,6 @@ pub unsafe extern "C" fn StartProxy(
         }
     }
 
-    cfproxy::init_cfproxy_domains();
-
     let dc_opt_map: HashMap<i32, String> = HashMap::new();
     *DC_OPT.write() = dc_opt_map.clone();
 
@@ -224,7 +248,8 @@ pub unsafe extern "C" fn StartProxy(
     let cancel_sessions = Arc::new(parking_lot::RwLock::new(cancel_tasks.child_token()));
     let pool = Arc::new(WsPool::new(cancel_tasks.clone()));
 
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<u16, (std::io::ErrorKind, String)>>();
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(1);
 
     let pool_task = pool.clone();
     let host_task = host.clone();
@@ -233,14 +258,15 @@ pub unsafe extern "C" fn StartProxy(
     let cancel_sessions_task = cancel_sessions.clone();
 
     let handle = rt.spawn(async move {
+        let _done_signal = ListenerDoneSignal(Some(done_tx));
         let addr = format!("{}:{}", host_task, go_port);
-        match bind_reuse_tcp(&addr) {
-            Ok(listener) => {
-                let _ = tx.send(Ok(()));
+        match platform::bind_local_tcp(&addr) {
+            Ok((listener, bound_port)) => {
+                let _ = tx.send(Ok(bound_port));
                 if let Err(e) = run_proxy(
                     pool_task,
                     host_task,
-                    go_port,
+                    bound_port,
                     map_task,
                     cancel_root,
                     cancel_sessions_task,
@@ -252,26 +278,24 @@ pub unsafe extern "C" fn StartProxy(
                 }
             }
             Err(e) => {
-                let _ = tx.send(Err(format!("listen on {}: {}", addr, e)));
+                let kind = e.kind();
+                let _ = tx.send(Err((kind, format!("listen on {}: {}", addr, e))));
             }
         }
     });
 
-    match rx.recv() {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            handle.abort();
-            crate::lwarn!("StartProxy bind error: {}", e);
-            if e.contains("Address already in use") || e.contains("os error 98") || e.contains("os error 10048") {
-                return -1; // Busy port
-            }
-            return -2;
+    let bound_port = match rx.recv() {
+        Ok(Ok(p)) => p,
+        Ok(Err((kind, msg))) => {
+            abort_and_wait_listener_drop(handle, cancel_tasks, done_rx);
+            crate::lwarn!("StartProxy bind error: {}", msg);
+            return map_bind_error(kind);
         }
         Err(_) => {
-            handle.abort();
+            abort_and_wait_listener_drop(handle, cancel_tasks, done_rx);
             return -3;
         }
-    }
+    };
 
     let cancel_balancer = cancel_tasks.clone();
     rt.spawn(async move {
@@ -283,8 +307,10 @@ pub unsafe extern "C" fn StartProxy(
         handle,
         cancel_tasks,
         cancel_sessions,
+        done_rx,
     });
     mark_engine_started();
+    MTPROTO_LISTEN_PORT.store(bound_port, Ordering::Release);
     MTPROTO_RUNNING.store(true, Ordering::Release);
 
     0
@@ -296,6 +322,10 @@ pub unsafe extern "C" fn StartSocks5Proxy(
     port: c_int,
     verbose: c_int,
 ) -> c_int {
+    if port < 0 || port > u16::MAX as c_int {
+        return -2;
+    }
+
     init_crypto_and_panic_hook();
 
     let cell = socks5_state_cell();
@@ -303,9 +333,9 @@ pub unsafe extern "C" fn StartSocks5Proxy(
 
     if let Some(old_state) = guard.take() {
         SOCKS5_RUNNING.store(false, Ordering::Release);
+        SOCKS5_LISTEN_PORT.store(0, Ordering::Release);
         crate::linfo!("StartSocks5Proxy: taking down previous active SOCKS5 state before restart");
-        old_state.cancel_tasks.cancel();
-        old_state.handle.abort();
+        abort_and_wait_listener_drop(old_state.handle, old_state.cancel_tasks, old_state.done_rx);
     }
 
     generation_guard::change_config(|| {});
@@ -326,20 +356,22 @@ pub unsafe extern "C" fn StartSocks5Proxy(
     let cancel_tasks = CancellationToken::new();
     let cancel_sessions = Arc::new(parking_lot::RwLock::new(cancel_tasks.child_token()));
 
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<u16, (std::io::ErrorKind, String)>>();
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(1);
 
     let host_task = host.clone();
     let cancel_root = cancel_tasks.clone();
     let cancel_sessions_task = cancel_sessions.clone();
 
     let handle = rt.spawn(async move {
+        let _done_signal = ListenerDoneSignal(Some(done_tx));
         let addr = format!("{}:{}", host_task, go_port);
-        match bind_reuse_tcp(&addr) {
-            Ok(listener) => {
-                let _ = tx.send(Ok(()));
+        match platform::bind_local_tcp(&addr) {
+            Ok((listener, bound_port)) => {
+                let _ = tx.send(Ok(bound_port));
                 if let Err(e) = run_socks5_server(
                     host_task,
-                    go_port,
+                    bound_port,
                     cancel_root,
                     cancel_sessions_task,
                     listener,
@@ -350,26 +382,24 @@ pub unsafe extern "C" fn StartSocks5Proxy(
                 }
             }
             Err(e) => {
-                let _ = tx.send(Err(format!("listen socks5 on {}: {}", addr, e)));
+                let kind = e.kind();
+                let _ = tx.send(Err((kind, format!("listen socks5 on {}: {}", addr, e))));
             }
         }
     });
 
-    match rx.recv() {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            handle.abort();
-            crate::lwarn!("StartSocks5Proxy bind error: {}", e);
-            if e.contains("Address already in use") || e.contains("os error 98") || e.contains("os error 10048") {
-                return -1; // Busy port
-            }
-            return -2;
+    let bound_port = match rx.recv() {
+        Ok(Ok(p)) => p,
+        Ok(Err((kind, msg))) => {
+            abort_and_wait_listener_drop(handle, cancel_tasks, done_rx);
+            crate::lwarn!("StartSocks5Proxy bind error: {}", msg);
+            return map_bind_error(kind);
         }
         Err(_) => {
-            handle.abort();
+            abort_and_wait_listener_drop(handle, cancel_tasks, done_rx);
             return -3;
         }
-    }
+    };
 
     let cancel_warm = cancel_tasks.clone();
     rt.spawn(async move {
@@ -381,11 +411,53 @@ pub unsafe extern "C" fn StartSocks5Proxy(
         handle,
         cancel_tasks,
         cancel_sessions,
+        done_rx,
     });
     mark_engine_started();
+    SOCKS5_LISTEN_PORT.store(bound_port, Ordering::Release);
     SOCKS5_RUNNING.store(true, Ordering::Release);
 
     0
+}
+
+#[no_mangle]
+pub extern "C" fn GetMtprotoListenPort() -> c_int {
+    if MTPROTO_RUNNING.load(Ordering::Acquire) {
+        MTPROTO_LISTEN_PORT.load(Ordering::Acquire) as c_int
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn GetSocks5ListenPort() -> c_int {
+    if SOCKS5_RUNNING.load(Ordering::Acquire) {
+        SOCKS5_LISTEN_PORT.load(Ordering::Acquire) as c_int
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn SetRuntimeWorkerThreads(threads: c_int) -> c_int {
+    if threads <= 0 {
+        REQUESTED_RUNTIME_THREADS.store(0, Ordering::Release);
+    } else {
+        let clamped = (threads as usize).clamp(1, 16);
+        REQUESTED_RUNTIME_THREADS.store(clamped, Ordering::Release);
+    }
+    if RUNTIME.get().is_some() {
+        return -1;
+    }
+    effective_runtime_worker_threads() as c_int
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn SetLogCallback(
+    callback: Option<platform::LogCallbackFn>,
+    user_data: *mut c_void,
+) {
+    platform::set_log_callback(callback, user_data);
 }
 
 #[no_mangle]
@@ -398,15 +470,13 @@ pub extern "C" fn StopProxy() -> c_int {
 #[no_mangle]
 pub extern "C" fn StopMtprotoProxy() -> c_int {
     MTPROTO_RUNNING.store(false, Ordering::Release);
-    let mut guard = mtproto_state_cell().lock();
-    if let Some(state) = guard.take() {
+    MTPROTO_LISTEN_PORT.store(0, Ordering::Release);
+    let state_opt = mtproto_state_cell().lock().take();
+    if let Some(state) = state_opt {
         crate::linfo!("StopMtprotoProxy: cancelling MTProto tasks");
-        state.cancel_tasks.cancel();
         let pool = state.pool;
-        let handle = state.handle;
-        handle.abort();
+        abort_and_wait_listener_drop(state.handle, state.cancel_tasks, state.done_rx);
         runtime().spawn(async move {
-            let _ = handle.await;
             pool.close_all().await;
         });
     }
@@ -416,12 +486,11 @@ pub extern "C" fn StopMtprotoProxy() -> c_int {
 #[no_mangle]
 pub extern "C" fn StopSocks5Proxy() -> c_int {
     SOCKS5_RUNNING.store(false, Ordering::Release);
-    let mut guard = socks5_state_cell().lock();
-    if let Some(state) = guard.take() {
+    SOCKS5_LISTEN_PORT.store(0, Ordering::Release);
+    let state_opt = socks5_state_cell().lock().take();
+    if let Some(state) = state_opt {
         crate::linfo!("StopSocks5Proxy: cancelling SOCKS5 tasks");
-        state.cancel_tasks.cancel();
-        let handle = state.handle;
-        handle.abort();
+        abort_and_wait_listener_drop(state.handle, state.cancel_tasks, state.done_rx);
     }
     0
 }
@@ -988,254 +1057,267 @@ pub unsafe extern "C" fn FreeString(p: *mut c_char) {
 }
 
 // ===========================================================================
-// JNI Bridge for MirrlyEngineController
+// JNI Bridge for MirrlyEngineController (Android or explicit `jni` feature)
 // ===========================================================================
 
-type JNIEnv = *mut *const *const std::ffi::c_void;
-type JString = *mut std::ffi::c_void;
-type JClass = *mut std::ffi::c_void;
-type JBoolean = u8;
-type JInt = i32;
-type JLong = i64;
+#[cfg(any(target_os = "android", feature = "jni"))]
+mod jni_bridge {
+    use super::*;
 
-unsafe fn jni_get_string(env: JNIEnv, jstr: JString) -> String {
-    if env.is_null() || jstr.is_null() {
-        return String::new();
+    type JNIEnv = *mut *const *const std::ffi::c_void;
+    type JString = *mut std::ffi::c_void;
+    type JClass = *mut std::ffi::c_void;
+    type JBoolean = u8;
+    type JInt = i32;
+    type JLong = i64;
+
+    unsafe fn jni_get_string(env: JNIEnv, jstr: JString) -> String {
+        if env.is_null() || jstr.is_null() {
+            return String::new();
+        }
+        let table = *env;
+        let get_utf_chars_fn: extern "system" fn(
+            JNIEnv,
+            JString,
+            *mut JBoolean,
+        ) -> *const std::os::raw::c_char = std::mem::transmute(*table.add(169));
+        let release_utf_chars_fn: extern "system" fn(
+            JNIEnv,
+            JString,
+            *const std::os::raw::c_char,
+        ) = std::mem::transmute(*table.add(170));
+
+        let chars = get_utf_chars_fn(env, jstr, std::ptr::null_mut());
+        if chars.is_null() {
+            return String::new();
+        }
+        let res = std::ffi::CStr::from_ptr(chars)
+            .to_string_lossy()
+            .into_owned();
+        release_utf_chars_fn(env, jstr, chars);
+        res
     }
-    let table = *env;
-    let get_utf_chars_fn: extern "system" fn(JNIEnv, JString, *mut JBoolean) -> *const std::os::raw::c_char =
-        std::mem::transmute(*table.add(169));
-    let release_utf_chars_fn: extern "system" fn(JNIEnv, JString, *const std::os::raw::c_char) =
-        std::mem::transmute(*table.add(170));
 
-    let chars = get_utf_chars_fn(env, jstr, std::ptr::null_mut());
-    if chars.is_null() {
-        return String::new();
+    unsafe fn jni_new_string(env: JNIEnv, s: &str) -> JString {
+        if env.is_null() {
+            return std::ptr::null_mut();
+        }
+        let c_str = match std::ffi::CString::new(s) {
+            Ok(cs) => cs,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let table = *env;
+        let new_utf_fn: extern "system" fn(JNIEnv, *const std::os::raw::c_char) -> JString =
+            std::mem::transmute(*table.add(167));
+        new_utf_fn(env, c_str.as_ptr())
     }
-    let res = std::ffi::CStr::from_ptr(chars).to_string_lossy().into_owned();
-    release_utf_chars_fn(env, jstr, chars);
-    res
-}
 
-unsafe fn jni_new_string(env: JNIEnv, s: &str) -> JString {
-    if env.is_null() {
-        return std::ptr::null_mut();
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeStartSocks5(
+        env: JNIEnv,
+        _class: JClass,
+        j_ip: JString,
+        port: JInt,
+    ) -> JString {
+        let ip = jni_get_string(env, j_ip);
+        let c_ip = match std::ffi::CString::new(ip) {
+            Ok(s) => s,
+            Err(_) => return jni_new_string(env, "Invalid IP"),
+        };
+        let code = StartSocks5Proxy(c_ip.as_ptr(), port, 1);
+        if code == 0 {
+            std::ptr::null_mut()
+        } else if code == -1 {
+            jni_new_string(env, "PORT_BUSY")
+        } else {
+            jni_new_string(env, "BIND_FAILED")
+        }
     }
-    let c_str = match std::ffi::CString::new(s) {
-        Ok(cs) => cs,
-        Err(_) => return std::ptr::null_mut(),
-    };
-    let table = *env;
-    let new_utf_fn: extern "system" fn(JNIEnv, *const std::os::raw::c_char) -> JString =
-        std::mem::transmute(*table.add(167));
-    new_utf_fn(env, c_str.as_ptr())
-}
 
-#[no_mangle]
-pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeStartSocks5(
-    env: JNIEnv,
-    _class: JClass,
-    j_ip: JString,
-    port: JInt,
-) -> JString {
-    let ip = jni_get_string(env, j_ip);
-    let c_ip = match std::ffi::CString::new(ip) {
-        Ok(s) => s,
-        Err(_) => return jni_new_string(env, "Invalid IP"),
-    };
-    let code = StartSocks5Proxy(c_ip.as_ptr(), port, 1);
-    if code == 0 {
-        std::ptr::null_mut()
-    } else if code == -1 {
-        jni_new_string(env, "PORT_BUSY")
-    } else {
-        jni_new_string(env, "BIND_FAILED")
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeStartMtproto(
+        env: JNIEnv,
+        _class: JClass,
+        j_ip: JString,
+        port: JInt,
+        j_secret: JString,
+        j_upstream: JString,
+    ) -> JString {
+        let ip = jni_get_string(env, j_ip);
+        let secret = jni_get_string(env, j_secret);
+        let upstream = jni_get_string(env, j_upstream);
+
+        let c_ip = match std::ffi::CString::new(ip) {
+            Ok(s) => s,
+            Err(_) => return jni_new_string(env, "Invalid IP"),
+        };
+        let c_sec = match std::ffi::CString::new(secret) {
+            Ok(s) => s,
+            Err(_) => return jni_new_string(env, "Invalid Secret"),
+        };
+        let c_up = match std::ffi::CString::new(upstream) {
+            Ok(s) => s,
+            Err(_) => return jni_new_string(env, "Invalid Upstream"),
+        };
+
+        let code = StartProxy(c_ip.as_ptr(), port, c_up.as_ptr(), c_sec.as_ptr(), 1);
+        if code == 0 {
+            std::ptr::null_mut()
+        } else if code == -1 {
+            jni_new_string(env, "PORT_BUSY")
+        } else {
+            jni_new_string(env, "BIND_FAILED")
+        }
     }
-}
 
-#[no_mangle]
-pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeStartMtproto(
-    env: JNIEnv,
-    _class: JClass,
-    j_ip: JString,
-    port: JInt,
-    j_secret: JString,
-    j_upstream: JString,
-) -> JString {
-    let ip = jni_get_string(env, j_ip);
-    let secret = jni_get_string(env, j_secret);
-    let upstream = jni_get_string(env, j_upstream);
-
-    let c_ip = match std::ffi::CString::new(ip) {
-        Ok(s) => s,
-        Err(_) => return jni_new_string(env, "Invalid IP"),
-    };
-    let c_sec = match std::ffi::CString::new(secret) {
-        Ok(s) => s,
-        Err(_) => return jni_new_string(env, "Invalid Secret"),
-    };
-    let c_up = match std::ffi::CString::new(upstream) {
-        Ok(s) => s,
-        Err(_) => return jni_new_string(env, "Invalid Upstream"),
-    };
-
-    let code = StartProxy(c_ip.as_ptr(), port, c_up.as_ptr(), c_sec.as_ptr(), 1);
-    if code == 0 {
-        std::ptr::null_mut()
-    } else if code == -1 {
-        jni_new_string(env, "PORT_BUSY")
-    } else {
-        jni_new_string(env, "BIND_FAILED")
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeStopProxy(
+        _env: JNIEnv,
+        _class: JClass,
+    ) {
+        StopProxy();
     }
-}
 
-#[no_mangle]
-pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeStopProxy(
-    _env: JNIEnv,
-    _class: JClass,
-) {
-    StopProxy();
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeSoftReconnect(
-    _env: JNIEnv,
-    _class: JClass,
-) {
-    ResetNetworkSockets();
-    SuspendNetworkSockets();
-    WarmupWsPool();
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeGetStatsJson(
-    env: JNIEnv,
-    _class: JClass,
-) -> JString {
-    let json = build_stats_json();
-    jni_new_string(env, &json)
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeGenerateSecret(
-    env: JNIEnv,
-    _class: JClass,
-    j_domain: JString,
-) -> JString {
-    let domain = jni_get_string(env, j_domain);
-    let target_domain = if domain.trim().is_empty() {
-        "www.google.com"
-    } else {
-        domain.trim()
-    };
-    use rand::RngCore;
-    let mut random_bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut random_bytes);
-    let random_hex = hex::encode(random_bytes);
-    let domain_hex = hex::encode(target_domain.as_bytes());
-    let secret = format!("ee{}{}", random_hex, domain_hex);
-    jni_new_string(env, &secret)
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeSetSecret(
-    env: JNIEnv,
-    _class: JClass,
-    j_secret: JString,
-) -> JInt {
-    let secret = jni_get_string(env, j_secret);
-    let c_sec = match std::ffi::CString::new(secret) {
-        Ok(s) => s,
-        Err(_) => return -1,
-    };
-    SetSecret(c_sec.as_ptr());
-    0
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeOnNetworkStateChanged(
-    _env: JNIEnv,
-    _class: JClass,
-    connected: JBoolean,
-    _is_wifi: JBoolean,
-    _is_cellular: JBoolean,
-) -> JLong {
-    if connected != 0 {
-        WarmupWsPool();
-    } else {
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeSoftReconnect(
+        _env: JNIEnv,
+        _class: JClass,
+    ) {
+        ResetNetworkSockets();
         SuspendNetworkSockets();
+        WarmupWsPool();
     }
-    0
-}
 
-#[no_mangle]
-pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeOnScreenWake(
-    _env: JNIEnv,
-    _class: JClass,
-) {
-    OnScreenWakeup();
-}
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeGetStatsJson(
+        env: JNIEnv,
+        _class: JClass,
+    ) -> JString {
+        let json = build_stats_json();
+        jni_new_string(env, &json)
+    }
 
-#[no_mangle]
-pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeSetCfProxyConfig(
-    env: JNIEnv,
-    _class: JClass,
-    j_domain: JString,
-    _j_secret: JString,
-) {
-    let domain = jni_get_string(env, j_domain);
-    let c_dom = match std::ffi::CString::new(domain) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    SetCfProxyConfig(1, c_dom.as_ptr());
-}
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeGenerateSecret(
+        env: JNIEnv,
+        _class: JClass,
+        j_domain: JString,
+    ) -> JString {
+        let domain = jni_get_string(env, j_domain);
+        let target_domain = if domain.trim().is_empty() {
+            "www.google.com"
+        } else {
+            domain.trim()
+        };
+        use rand::RngCore;
+        let mut random_bytes = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut random_bytes);
+        let random_hex = hex::encode(random_bytes);
+        let domain_hex = hex::encode(target_domain.as_bytes());
+        let secret = format!("ee{}{}", random_hex, domain_hex);
+        jni_new_string(env, &secret)
+    }
 
-#[no_mangle]
-pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeSetTlsClientHelloSplit(
-    _env: JNIEnv,
-    _class: JClass,
-    enabled: JBoolean,
-) {
-    SetTlsClientHelloSplitEnabled(if enabled != 0 { 1 } else { 0 });
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeSetTlsEnabled(
-    _env: JNIEnv,
-    _class: JClass,
-    enabled: JBoolean,
-) {
-    SetTlsEnabled(if enabled != 0 { 1 } else { 0 });
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeIsTlsEnabled(
-    _env: JNIEnv,
-    _class: JClass,
-) -> JBoolean {
-    if IsTlsEnabled() != 0 {
-        1
-    } else {
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeSetSecret(
+        env: JNIEnv,
+        _class: JClass,
+        j_secret: JString,
+    ) -> JInt {
+        let secret = jni_get_string(env, j_secret);
+        let c_sec = match std::ffi::CString::new(secret) {
+            Ok(s) => s,
+            Err(_) => return -1,
+        };
+        SetSecret(c_sec.as_ptr());
         0
     }
-}
 
-#[no_mangle]
-pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeSetTlsFingerprintProfile(
-    _env: JNIEnv,
-    _class: JClass,
-    _j_profile: JString,
-) -> JInt {
-    0
-}
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeOnNetworkStateChanged(
+        _env: JNIEnv,
+        _class: JClass,
+        connected: JBoolean,
+        _is_wifi: JBoolean,
+        _is_cellular: JBoolean,
+    ) -> JLong {
+        if connected != 0 {
+            WarmupWsPool();
+        } else {
+            SuspendNetworkSockets();
+        }
+        0
+    }
 
-#[no_mangle]
-pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeResetNetworkSockets(
-    _env: JNIEnv,
-    _class: JClass,
-) {
-    ResetNetworkSockets();
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeOnScreenWake(
+        _env: JNIEnv,
+        _class: JClass,
+    ) {
+        OnScreenWakeup();
+    }
+
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeSetCfProxyConfig(
+        env: JNIEnv,
+        _class: JClass,
+        j_domain: JString,
+        _j_secret: JString,
+    ) {
+        let domain = jni_get_string(env, j_domain);
+        let c_dom = match std::ffi::CString::new(domain) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        SetCfProxyConfig(1, c_dom.as_ptr());
+    }
+
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeSetTlsClientHelloSplit(
+        _env: JNIEnv,
+        _class: JClass,
+        enabled: JBoolean,
+    ) {
+        SetTlsClientHelloSplitEnabled(if enabled != 0 { 1 } else { 0 });
+    }
+
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeSetTlsEnabled(
+        _env: JNIEnv,
+        _class: JClass,
+        enabled: JBoolean,
+    ) {
+        SetTlsEnabled(if enabled != 0 { 1 } else { 0 });
+    }
+
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeIsTlsEnabled(
+        _env: JNIEnv,
+        _class: JClass,
+    ) -> JBoolean {
+        if IsTlsEnabled() != 0 {
+            1
+        } else {
+            0
+        }
+    }
+
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeSetTlsFingerprintProfile(
+        _env: JNIEnv,
+        _class: JClass,
+        _j_profile: JString,
+    ) -> JInt {
+        0
+    }
+
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeResetNetworkSockets(
+        _env: JNIEnv,
+        _class: JClass,
+    ) {
+        ResetNetworkSockets();
+    }
 }
 
 #[cfg(test)]

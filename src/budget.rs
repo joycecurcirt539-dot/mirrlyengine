@@ -12,7 +12,6 @@
 // 6. Generic Singleflight engine for per-host DNS deduplication to eliminate DoH storms.
 
 use crate::config::MOBILE_NETWORK;
-use crate::{ldebug, linfo};
 use once_cell::sync::Lazy;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -130,11 +129,22 @@ impl WaitingGuard {
     fn new(inner: Arc<DialBudgetInner>, category: FlowCategory) -> Self { Self { inner, category, armed: true } }
     fn disarm(&mut self) { self.armed = false; }
 }
+fn spawn_budget_release<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(fut);
+    } else {
+        crate::runtime().spawn(fut);
+    }
+}
+
 impl Drop for WaitingGuard {
     fn drop(&mut self) {
         if !self.armed { return; }
         let inner = self.inner.clone(); let category = self.category;
-        crate::runtime().spawn(async move {
+        spawn_budget_release(async move {
             let mut state = inner.state.lock().await;
             match category {
                 FlowCategory::UserFlow => state.waiting_user = state.waiting_user.saturating_sub(1),
@@ -151,9 +161,8 @@ impl Drop for DialPermit {
         let inner = self.inner.clone();
         let cat = self.category;
         // A permit can be dropped while an FFI-triggered shutdown is unwinding
-        // ownership. Always use Mirrly's runtime instead of assuming the
-        // current thread has entered a Tokio reactor.
-        crate::runtime().spawn(async move {
+        // ownership. Prefer the current Tokio reactor if entered, otherwise use Mirrly's runtime.
+        spawn_budget_release(async move {
             let mut state = inner.state.lock().await;
             match cat {
                 FlowCategory::UserFlow => {
@@ -559,8 +568,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_waiting_dial_is_rejected_when_network_generation_changes() {
-        MOBILE_NETWORK.store(true, Ordering::Relaxed);
-        let mgr = DialBudgetManager::new();
+        let _mobile_guard = crate::config::MobileNetworkTestGuard::set(true);
+        let mgr = DialBudgetManager::new_with_limits(2, 1);
         let _p1 = mgr.acquire(FlowCategory::UserFlow, None).await.unwrap();
         let _p2 = mgr.acquire(FlowCategory::UserFlow, None).await.unwrap();
 
@@ -580,40 +589,41 @@ mod tests {
 
         assert_eq!(result.err(), Some(BudgetError::GenerationMismatch));
         assert_eq!(mgr.stats().await.waiting_user, 0);
-        MOBILE_NETWORK.store(false, Ordering::Relaxed);
     }
 
     #[tokio::test]
     async fn test_dial_budget_mobile_limits() {
-        MOBILE_NETWORK.store(true, Ordering::Relaxed);
+        let _mobile_guard = crate::config::MobileNetworkTestGuard::set(true);
         let mgr = DialBudgetManager::new();
+        let (est_limit, _) = mgr.current_limits();
+        assert!(est_limit >= 2);
 
-        // Mobile allows 2 total active establishments
-        let p1 = mgr.acquire(FlowCategory::UserFlow, None).await.unwrap();
-        let _p2 = mgr.acquire(FlowCategory::UserFlow, None).await.unwrap();
+        let mut held = Vec::with_capacity(est_limit);
+        for _ in 0..est_limit {
+            held.push(mgr.acquire(FlowCategory::UserFlow, None).await.unwrap());
+        }
 
         let stats = mgr.stats().await;
-        assert_eq!(stats.active_user, 2);
-        assert_eq!(stats.active_total, 2);
+        assert_eq!(stats.active_user, est_limit);
+        assert_eq!(stats.active_total, est_limit);
 
-        // Third should not acquire immediately
+        // Next permit should not acquire immediately
         assert!(mgr.try_acquire(FlowCategory::UserFlow).await.is_none());
 
         // Background should not acquire immediately
         assert!(mgr.try_acquire(FlowCategory::Background).await.is_none());
 
-        drop(p1);
+        held.pop();
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         // Now one slot is available
-        let p3 = mgr.try_acquire(FlowCategory::UserFlow).await;
-        assert!(p3.is_some());
-
-        MOBILE_NETWORK.store(false, Ordering::Relaxed);
+        let p_next = mgr.try_acquire(FlowCategory::UserFlow).await;
+        assert!(p_next.is_some());
     }
 
     #[tokio::test]
     async fn test_dial_budget_user_priority_over_background() {
+        let _mobile_guard = crate::config::MobileNetworkTestGuard::set(true);
         let mgr = DialBudgetManager::new_with_limits(2, 1);
 
         // Consume all slots for current mobile profile
@@ -666,14 +676,12 @@ mod tests {
         let _ = bg_task.await;
         let _ = user_task.await;
         assert_eq!(bg_order.load(Ordering::SeqCst), 2);
-
-        MOBILE_NETWORK.store(false, Ordering::Relaxed);
     }
 
     #[tokio::test]
     async fn test_dial_budget_cancellation() {
-        MOBILE_NETWORK.store(true, Ordering::Relaxed);
-        let mgr = DialBudgetManager::new();
+        let _mobile_guard = crate::config::MobileNetworkTestGuard::set(true);
+        let mgr = DialBudgetManager::new_with_limits(2, 1);
 
         let _p1 = mgr.acquire(FlowCategory::UserFlow, None).await.unwrap();
         let _p2 = mgr.acquire(FlowCategory::UserFlow, None).await.unwrap();
@@ -695,8 +703,6 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(mgr.stats().await.waiting_user, 0);
-
-        MOBILE_NETWORK.store(false, Ordering::Relaxed);
     }
 
     #[tokio::test]

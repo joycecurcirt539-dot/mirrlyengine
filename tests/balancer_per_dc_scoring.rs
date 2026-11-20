@@ -1,4 +1,4 @@
-use mirrlyengine::balancer::{Balancer, BALANCER};
+use mirrlyengine::balancer::Balancer;
 
 #[test]
 fn test_dc2_speed_does_not_leak_to_dc4_or_dc1() {
@@ -97,10 +97,10 @@ fn test_useful_success_vs_probe_rtt() {
     // workerB has 85ms probe RTT
     b.record_probe_rtt(gen, 2, false, "workerB.dev", 85);
 
-    // Initially workerA is active
+    // Initially workerA is active (normalized to lowercase)
     assert_eq!(
         b.get_fastest_domain_for_dc(2, false).as_deref(),
-        Some("workerA.dev")
+        Some("workera.dev")
     );
 
     // workerB earns multiple useful successes: 4 * 15ms = 60ms max bonus
@@ -115,7 +115,7 @@ fn test_useful_success_vs_probe_rtt() {
     // workerB with useful success and low score becomes the winner
     assert_eq!(
         b.get_fastest_domain_for_dc(2, false).as_deref(),
-        Some("workerB.dev")
+        Some("workerb.dev")
     );
 }
 

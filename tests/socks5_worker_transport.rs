@@ -84,13 +84,13 @@ fn test_resolve_socks5_telegram_destination_ipv6_to_canonical_ipv4() {
 fn test_resolve_socks5_telegram_destination_flowseal_media_fix() {
     use mirrlyengine::socks5::*;
 
-    // Media connection with DC2 -> Flowseal Media Ingest (149.154.167.220:443)
+    // Media connection with DC2 -> Canonical DC2 Media endpoint (149.154.167.52:443)
     let (h_media, p_media) = resolve_socks5_telegram_destination("149.154.167.51", 443, Some(2), true);
-    assert_eq!(h_media, "149.154.167.220");
+    assert_eq!(h_media, "149.154.167.52");
     assert_eq!(p_media, 443);
 
-    // Media connection from IPv6 -> Flowseal Media Ingest
+    // Media connection from IPv6 -> Canonical DC2 Media endpoint (149.154.167.52:443)
     let (h_media_ipv6, p_media_ipv6) = resolve_socks5_telegram_destination("2001:67c:4e8:f002::a", 443, None, true);
-    assert_eq!(h_media_ipv6, "149.154.167.220");
+    assert_eq!(h_media_ipv6, "149.154.167.52");
     assert_eq!(p_media_ipv6, 443);
 }

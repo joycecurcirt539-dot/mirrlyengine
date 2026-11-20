@@ -1,6 +1,5 @@
 use crate::config::*;
 use crate::crypto::xor_mask_in_place;
-use crate::{ldebug, lwarn};
 use base64::Engine;
 use byteorder::{BigEndian, ByteOrder};
 use rand::RngCore;
@@ -1424,18 +1423,46 @@ pub fn build_frame(opcode: u8, data: &[u8], mask: bool) -> Vec<u8> {
 // Connection helpers
 // ---------------------------------------------------------------------------
 
-pub fn set_client_sock_opts(stream: &TcpStream) {
-    let _ = stream.set_nodelay(true);
-    let sock = socket2::SockRef::from(stream);
+fn apply_tcp_keepalive(socket: &socket2::Socket) {
     #[allow(unused_mut)]
     let mut ka = socket2::TcpKeepalive::new()
         .with_time(Duration::from_secs(15))
         .with_interval(Duration::from_secs(5));
-    #[cfg(any(target_os = "android", unix))]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
     {
         ka = ka.with_retries(3);
     }
-    let _ = sock.set_tcp_keepalive(&ka);
+    let _ = socket.set_tcp_keepalive(&ka);
+}
+
+fn apply_socket_buffer_bounds(socket: &socket2::Socket) {
+    let ceiling = crate::config::max_socket_buffer();
+    let target_recv = RECV_BUF.load(Ordering::Relaxed);
+    let target_send = SEND_BUF.load(Ordering::Relaxed);
+
+    if target_recv > 0 {
+        let recv_size = target_recv.clamp(MIN_SOCKET_BUFFER, ceiling) as usize;
+        let _ = socket.set_recv_buffer_size(recv_size);
+    }
+    if target_send > 0 {
+        let send_size = target_send.clamp(MIN_SOCKET_BUFFER, ceiling) as usize;
+        let _ = socket.set_send_buffer_size(send_size);
+    }
+}
+
+pub fn set_client_sock_opts(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
+    let sock = socket2::SockRef::from(stream);
+    crate::platform::configure_socket_platform(&sock);
+    apply_tcp_keepalive(&sock);
     // Note: Do NOT clamp TCP_MAXSEG on local client/loopback connections.
     // The Telegram client connects via 127.0.0.1 where MTU is 65536 bytes.
     // Clamping MSS on loopback would fragment local IPC into 1240-byte chunks
@@ -1445,18 +1472,11 @@ pub fn set_client_sock_opts(stream: &TcpStream) {
 pub fn set_sock_opts(stream: &TcpStream) {
     let _ = stream.set_nodelay(true);
     let sock = socket2::SockRef::from(stream);
+    crate::platform::configure_socket_platform(&sock);
 
     let target_recv = RECV_BUF.load(Ordering::Relaxed);
     let target_send = SEND_BUF.load(Ordering::Relaxed);
-
-    if target_recv > 0 {
-        let recv_size = target_recv.clamp(MIN_SOCKET_BUFFER, MAX_SOCKET_BUFFER) as usize;
-        let _ = sock.set_recv_buffer_size(recv_size);
-    }
-    if target_send > 0 {
-        let send_size = target_send.clamp(MIN_SOCKET_BUFFER, MAX_SOCKET_BUFFER) as usize;
-        let _ = sock.set_send_buffer_size(send_size);
-    }
+    apply_socket_buffer_bounds(&sock);
 
     let actual_recv = sock.recv_buffer_size().unwrap_or(0) as i32;
     let actual_send = sock.send_buffer_size().unwrap_or(0) as i32;
@@ -1474,28 +1494,8 @@ pub fn set_sock_opts(stream: &TcpStream) {
         );
     }
 
-    #[allow(unused_mut)]
-    let mut ka = socket2::TcpKeepalive::new()
-        .with_time(Duration::from_secs(15))
-        .with_interval(Duration::from_secs(5));
-    #[cfg(any(target_os = "android", unix))]
-    {
-        ka = ka.with_retries(3);
-    }
-    let _ = sock.set_tcp_keepalive(&ka);
-
-    #[cfg(any(target_os = "android", unix))]
-    unsafe {
-        use std::os::unix::io::AsRawFd;
-        let mss: libc::c_int = 1240;
-        libc::setsockopt(
-            sock.as_raw_fd(),
-            libc::IPPROTO_TCP,
-            libc::TCP_MAXSEG,
-            &mss as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-    }
+    apply_tcp_keepalive(&sock);
+    crate::platform::apply_mobile_mss_clamp(&sock);
 }
 
 pub async fn connect_outbound_tcp(
@@ -1511,44 +1511,13 @@ pub async fn connect_outbound_tcp(
     let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
         .map_err(WsError::Io)?;
 
+    crate::platform::configure_socket_platform(&socket);
     let _ = socket.set_nonblocking(true);
     let _ = socket.set_nodelay(true);
 
-    #[allow(unused_mut)]
-    let mut ka = socket2::TcpKeepalive::new()
-        .with_time(Duration::from_secs(15))
-        .with_interval(Duration::from_secs(5));
-    #[cfg(any(target_os = "android", unix))]
-    {
-        ka = ka.with_retries(3);
-    }
-    let _ = socket.set_tcp_keepalive(&ka);
-
-    #[cfg(any(target_os = "android", unix))]
-    if MOBILE_NETWORK.load(Ordering::Relaxed) {
-        unsafe {
-            use std::os::unix::io::AsRawFd;
-            let mss: libc::c_int = 1240;
-            libc::setsockopt(
-                socket.as_raw_fd(),
-                libc::IPPROTO_TCP,
-                libc::TCP_MAXSEG,
-                &mss as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
-    }
-
-    let target_recv = RECV_BUF.load(Ordering::Relaxed);
-    let target_send = SEND_BUF.load(Ordering::Relaxed);
-    if target_recv > 0 {
-        let recv_size = target_recv.clamp(MIN_SOCKET_BUFFER, MAX_SOCKET_BUFFER) as usize;
-        let _ = socket.set_recv_buffer_size(recv_size);
-    }
-    if target_send > 0 {
-        let send_size = target_send.clamp(MIN_SOCKET_BUFFER, MAX_SOCKET_BUFFER) as usize;
-        let _ = socket.set_send_buffer_size(send_size);
-    }
+    apply_tcp_keepalive(&socket);
+    crate::platform::apply_mobile_mss_clamp(&socket);
+    apply_socket_buffer_bounds(&socket);
 
     let target_sockaddr = socket2::SockAddr::from(*addr);
     match socket.connect(&target_sockaddr) {
@@ -2871,12 +2840,12 @@ mod tests {
 
     #[test]
     fn test_happy_eyeballs_delay_calculation() {
-        MOBILE_NETWORK.store(false, Ordering::Relaxed);
+        let _mobile_guard = crate::config::MobileNetworkTestGuard::set(false);
         let wifi_delay = compute_happy_eyeballs_delay();
         assert!(wifi_delay >= Duration::from_millis(100));
         assert!(wifi_delay <= Duration::from_millis(1000));
 
-        MOBILE_NETWORK.store(true, Ordering::Relaxed);
+        MOBILE_NETWORK.store(true, Ordering::SeqCst);
         let mobile_delay = compute_happy_eyeballs_delay();
         assert!(mobile_delay >= Duration::from_millis(180));
         assert!(mobile_delay <= Duration::from_millis(2000));

@@ -63,12 +63,12 @@ impl Default for NetworkProfile {
         Self {
             schema_version: 1,
             generation: 1,
-            validated: false,
-            suspended: true,
+            validated: true,
+            suspended: false,
             metered: false,
             roaming: false,
             congested: false,
-            transport: "NONE".to_string(),
+            transport: crate::platform::default_transport().to_string(),
             cellular: false,
             wifi: false,
             estimated_down_kbps: 0,
@@ -78,7 +78,7 @@ impl Default for NetworkProfile {
             power_mode: "ACTIVE".to_string(),
             transport_sli: TransportSli::default(),
             happy_eyeballs_delay_ms: 0,
-            ip_family_preference: "IPV4_ONLY".to_string(),
+            ip_family_preference: crate::platform::default_ip_family_preference().to_string(),
             websocket_keep_alive_seconds: 60,
         }
     }

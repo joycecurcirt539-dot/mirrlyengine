@@ -809,53 +809,26 @@ pub fn human_bytes(n: i64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Logger (Android log + stderr)
+// Logger (platform stderr / Android logcat / C-FFI callback)
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "android")]
-fn android_log_line(line: &str) {
-    use std::ffi::CString;
-    unsafe extern "C" {
-        fn __android_log_print(prio: i32, tag: *const i8, fmt: *const i8, ...) -> i32;
-    }
-    const ANDROID_LOG_INFO: i32 = 4;
-    if let (Ok(tag), Ok(fmt), Ok(msg)) = (
-        CString::new("TgWsProxy"),
-        CString::new("%s"),
-        CString::new(line),
-    ) {
-        unsafe {
-            __android_log_print(
-                ANDROID_LOG_INFO,
-                tag.as_ptr() as *const i8,
-                fmt.as_ptr() as *const i8,
-                msg.as_ptr() as *const i8,
-            );
-        }
-    }
-}
-
-#[cfg(not(target_os = "android"))]
-fn android_log_line(_line: &str) {}
-
-fn emit(prefix: &str, msg: &str) {
+fn emit(level: crate::platform::LogLevel, prefix: &str, msg: &str) {
     let line = format!("{}{}", prefix, msg);
-    eprintln!("{}", line);
-    android_log_line(&line);
+    crate::platform::emit_log(level, &line);
 }
 
 pub fn log_info(msg: &str) {
-    emit("", msg);
+    emit(crate::platform::LogLevel::Info, "", msg);
 }
 pub fn log_warn(msg: &str) {
-    emit("[WARN] ", msg);
+    emit(crate::platform::LogLevel::Warn, "[WARN] ", msg);
 }
 pub fn log_error(msg: &str) {
-    emit("[ERROR] ", msg);
+    emit(crate::platform::LogLevel::Error, "[ERROR] ", msg);
 }
 pub fn log_debug(msg: &str) {
     if LOG_VERBOSE.load(Ordering::Relaxed) {
-        emit("[DEBUG] ", msg);
+        emit(crate::platform::LogLevel::Debug, "[DEBUG] ", msg);
     }
 }
 
@@ -878,6 +851,29 @@ pub fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+pub(crate) struct MobileNetworkTestGuard {
+    _lock: parking_lot::MutexGuard<'static, ()>,
+    prev: bool,
+}
+
+#[cfg(test)]
+impl MobileNetworkTestGuard {
+    pub(crate) fn set(is_mobile: bool) -> Self {
+        static LOCK: Lazy<parking_lot::Mutex<()>> = Lazy::new(|| parking_lot::Mutex::new(()));
+        let lock = LOCK.lock();
+        let prev = MOBILE_NETWORK.swap(is_mobile, Ordering::SeqCst);
+        Self { _lock: lock, prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for MobileNetworkTestGuard {
+    fn drop(&mut self) {
+        MOBILE_NETWORK.store(self.prev, Ordering::SeqCst);
+    }
 }
 
 

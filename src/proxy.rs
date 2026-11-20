@@ -1415,16 +1415,9 @@ pub async fn handle_client(
     let label = peer;
 
     set_client_sock_opts(&conn);
-    if !crate::traffic_guard::is_traffic_authorized() {
-        STATS.connections_bad.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
 
     let current_secret = PROXY_SECRET.read().clone();
-    let mut raw_secret_bytes = hex::decode(&current_secret).unwrap_or_default();
-    if crate::traffic_guard::should_poison_traffic() && !raw_secret_bytes.is_empty() {
-        raw_secret_bytes[0] ^= 0x5A;
-    }
+    let raw_secret_bytes = hex::decode(&current_secret).unwrap_or_default();
     // Telegram Fake-TLS/DD secret derivation contract:
     // If secret starts with 0xee or 0xdd, Telegram hashes exactly 16 bytes starting at index 1: raw_secret_bytes[1..17].
     // If it's a standard 16-byte hex secret, Telegram hashes raw_secret_bytes[0..16].
@@ -1750,7 +1743,7 @@ mod tests {
         let slot_dc4_media = DcSlot { dc: 4, is_media: 1 };
 
         // 1. Mobile profile: DC2 chat and media have baseline target 1 for 0 ms pre-warm, DC4 slots are 0 without demand
-        MOBILE_NETWORK.store(true, Ordering::Relaxed);
+        let _mobile_guard = crate::config::MobileNetworkTestGuard::set(true);
         assert_eq!(pool.target_size(slot_dc2_chat), 1);
         assert_eq!(pool.target_size(slot_dc4_chat), 0);
         assert_eq!(pool.target_size(slot_dc2_media), 1);
@@ -1765,7 +1758,7 @@ mod tests {
         assert_eq!(pool.target_size(slot_dc2_media), 1);
 
         // 4. Wi-Fi profile: baseline 2 for DC2 chat (configured.min(2).max(1)), expands with useful RX
-        MOBILE_NETWORK.store(false, Ordering::Relaxed);
+        MOBILE_NETWORK.store(false, Ordering::SeqCst);
         MTPROTO_STANDBY_PER_ACTIVE_SLOT_REQUESTED.store(4, Ordering::Relaxed);
         assert_eq!(pool.target_size(slot_dc2_chat), 2); // Baseline 2 on Wi-Fi until sustained useful RX
 
@@ -1773,8 +1766,6 @@ mod tests {
         pool.record_useful_rx(2, false);
         pool.record_useful_rx(2, false);
         assert_eq!(pool.target_size(slot_dc2_chat), 4); // Expands to 4 after sustained useful traffic
-
-        MOBILE_NETWORK.store(false, Ordering::Relaxed);
     }
 
     #[tokio::test]
@@ -1831,41 +1822,40 @@ mod tests {
         let raw_ws = Arc::new(RawWebSocket::from_plain_stream_for_heartbeat_test(client));
         let now = 1000i64;
 
+        let max_age = WS_POOL_REUSE_MAX_AGE as i64;
         let entry_fresh = PoolEntry {
             ws: raw_ws.clone(),
             domain: "test.worker.dev".to_string(),
             created: now - 10,
         };
 
-        let entry_cellular_stale = PoolEntry {
+        let entry_boundary = PoolEntry {
             ws: raw_ws.clone(),
             domain: "test.worker.dev".to_string(),
-            created: now - 23,
+            created: now - max_age,
         };
 
-        let entry_wifi_stale = PoolEntry {
+        let entry_stale = PoolEntry {
             ws: raw_ws.clone(),
             domain: "test.worker.dev".to_string(),
-            created: now - 46,
+            created: now - (max_age + 1),
         };
 
-        // 1. Mobile profile (TTL = 22s)
-        MOBILE_NETWORK.store(true, Ordering::Relaxed);
+        // 1. Mobile profile uses WS_POOL_REUSE_MAX_AGE
+        let _mobile_guard = crate::config::MobileNetworkTestGuard::set(true);
         assert!(is_pool_entry_usable(&entry_fresh, now));
-        assert!(!is_pool_entry_usable(&entry_cellular_stale, now));
-        assert!(!is_pool_entry_usable(&entry_wifi_stale, now));
+        assert!(is_pool_entry_usable(&entry_boundary, now));
+        assert!(!is_pool_entry_usable(&entry_stale, now));
 
-        // 2. Wi-Fi profile (TTL = 45s)
-        MOBILE_NETWORK.store(false, Ordering::Relaxed);
+        // 2. Wi-Fi profile uses WS_POOL_REUSE_MAX_AGE
+        MOBILE_NETWORK.store(false, Ordering::SeqCst);
         assert!(is_pool_entry_usable(&entry_fresh, now));
-        assert!(is_pool_entry_usable(&entry_cellular_stale, now));
-        assert!(!is_pool_entry_usable(&entry_wifi_stale, now));
+        assert!(is_pool_entry_usable(&entry_boundary, now));
+        assert!(!is_pool_entry_usable(&entry_stale, now));
 
         // 3. Closed socket is never usable
         raw_ws.closed.store(true, Ordering::Relaxed);
         assert!(!is_pool_entry_usable(&entry_fresh, now));
-
-        MOBILE_NETWORK.store(false, Ordering::Relaxed);
     }
 
     #[tokio::test]

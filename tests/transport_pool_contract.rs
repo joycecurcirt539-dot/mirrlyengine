@@ -41,7 +41,8 @@ fn requested_effective_budget_and_socks_flows_share_one_contract() {
 
     let socks = get_transport_pool_status("socks5");
     assert_eq!(socks.socks_concurrent_flows, 5);
-    assert_eq!(socks.global_establishment_budget, 4);
+    assert_eq!(socks.global_establishment_budget, DIAL_BUDGET.current_limits().0);
+    assert_eq!(socks.global_establishment_budget, 10);
 
     MOBILE_NETWORK.store(true, Ordering::Relaxed);
     assert_eq!(SetMtprotoStandbyPerActiveSlot(3), 1);
@@ -52,7 +53,7 @@ fn requested_effective_budget_and_socks_flows_share_one_contract() {
         mobile.global_establishment_budget,
         DIAL_BUDGET.current_limits().0
     );
-    assert_eq!(mobile.global_establishment_budget, 2);
+    assert_eq!(mobile.global_establishment_budget, 8);
 
     // SetPoolSize & set_pool_size compatibility
     MOBILE_NETWORK.store(false, Ordering::Relaxed);

@@ -240,6 +240,10 @@ async fn websocket_half_close_drains_before_peer_close() {
         false,
         "149.154.167.51",
         CancellationToken::new(),
+        None,
+        Vec::new(),
+        None,
+        false,
     ));
     client.shutdown().await.unwrap();
     peer.write_all(&[0x82, 3, 1, 2, 3, 0x88, 0]).await.unwrap();

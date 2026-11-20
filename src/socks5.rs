@@ -2,7 +2,6 @@ use crate::cfproxy::*;
 use crate::config::*;
 use crate::crypto::{new_aes_ctr, MsgSplitter};
 use crate::ws::*;
-use crate::{ldebug, linfo, lwarn};
 use byteorder::{ByteOrder, LittleEndian};
 use once_cell::sync::Lazy;
 use sha2::Digest;
@@ -111,6 +110,8 @@ pub async fn run_socks5_server(
         }
     }
 
+    drop(listener);
+
     if tokio::time::timeout(Duration::from_secs(2), async {
         while sessions.join_next().await.is_some() {}
     })
@@ -140,10 +141,6 @@ async fn handle_socks5_client(
     let _guard = ActiveGuard;
 
     set_client_sock_opts(&client);
-    if !crate::traffic_guard::is_traffic_authorized() {
-        let _ = client.write_all(&[0x05, 0xFF]).await;
-        return;
-    }
 
     // 1. Handshake: Auth methods (RFC 1928 / RFC 1929)
     let mut header = [0u8; 2];
@@ -541,7 +538,7 @@ pub fn is_telegram_host(host: &str) -> bool {
                     return true;
                 }
                 // 194.221.248.0/21: 194.221.(248..=255).*
-                if octets[0] == 194 && octets[1] == 221 && (octets[2] >= 248 && octets[2] <= 255) {
+                if octets[0] == 194 && octets[1] == 221 && octets[2] >= 248 {
                     return true;
                 }
                 false
@@ -828,7 +825,7 @@ pub fn trigger_warm_socks5_refill(user_domain: String, dc: i32, is_media: bool, 
                 let timeout = crate::config::adaptive_ws_connect_timeout().max(8.0);
                 let (ws_opt, domain_tag) = if is_flowseal {
                     let effective_dc = DC_OVERRIDES.get(&dc).copied().unwrap_or(dc);
-                    let (enabled, mut domains) = {
+                    let (_enabled, mut domains) = {
                         let cfg = CFPROXY.read();
                         (CFPROXY_ENABLED.load(Ordering::Relaxed), cfg.domains.clone())
                     };
@@ -1900,10 +1897,20 @@ mod tests {
         assert_eq!(dst, "149.154.167.91");
         assert_eq!(port, 443);
 
-        // DC4 media maps to canonical DC4 IPv4
+        // Explicit DC4 media IP is preserved verbatim
         let (dst, port) =
             resolve_socks5_telegram_destination("149.154.167.118", 443, Some(4), true);
-        assert_eq!(dst, "149.154.167.91");
+        assert_eq!(dst, "149.154.167.118");
+        assert_eq!(port, 443);
+
+        // Non-explicit DC4 media IPv6 resolves to canonical DC4 media IPv4
+        let (dst, port) = resolve_socks5_telegram_destination(
+            "2001:067c:04e8:f004:0000:0000:0000:0007",
+            443,
+            Some(4),
+            true,
+        );
+        assert_eq!(dst, "149.154.167.93");
         assert_eq!(port, 443);
 
         // DC2 maps to canonical DC2 IPv4

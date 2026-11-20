@@ -3,7 +3,6 @@ use crate::ws::{
     is_http_status_error, ws_connect_happy_eyeballs, RawWebSocket,
     WsError,
 };
-use crate::{ldebug, lerror, linfo, lwarn};
 use std::net::{IpAddr, SocketAddr};
 use once_cell::sync::Lazy;
 use std::path::PathBuf;

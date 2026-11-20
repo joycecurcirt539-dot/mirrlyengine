@@ -2,15 +2,16 @@
 
 # mirrlyengine
 
-**Универсальное нативное прокси-ядро на Rust (`Tokio`, `rustls`, `ring`) для ПК (`Windows`, `Linux`), `Android` и в будущем `iOS` с поддержкой `SOCKS5`, `MTProto FakeTLS`, Anycast CDN ([Flowseal](https://github.com/Flowseal)) и Cloudflare Worker `WSS`**
+**Универсальное нативное прокси-ядро на Rust (`Tokio`, `rustls`, `ring`) для `Windows`, `Linux`, `macOS`, `iOS` и `Android` с поддержкой `SOCKS5`, `MTProto FakeTLS`, Anycast CDN ([Flowseal](https://github.com/Flowseal)) и Cloudflare Worker `WSS`**
 
 <br/>
 
 [![Rust](https://img.shields.io/badge/Ядро-Rust_Tokio-1E293B?logo=rust&logoColor=DEA584)](src/lib.rs)
-[![Windows](https://img.shields.io/badge/ПК-Windows-1E293B?logo=windows&logoColor=0078D6)](#2-поддерживаемые-платформы)
-[![Linux](https://img.shields.io/badge/ПК-Linux-1E293B?logo=linux&logoColor=FCC624)](#2-поддерживаемые-платформы)
+[![Windows](https://img.shields.io/badge/Desktop-Windows-1E293B?logo=windows&logoColor=0078D6)](#2-поддерживаемые-платформы)
+[![Linux](https://img.shields.io/badge/Desktop-Linux-1E293B?logo=linux&logoColor=FCC624)](#2-поддерживаемые-платформы)
+[![macOS](https://img.shields.io/badge/Desktop-macOS-1E293B?logo=apple&logoColor=A2AAAD)](#2-поддерживаемые-платформы)
 [![Android](https://img.shields.io/badge/Mobile-Android_API_23%2B-1E293B?logo=android&logoColor=3DDC84)](#2-поддерживаемые-платформы)
-[![iOS](https://img.shields.io/badge/Mobile-iOS_(В_планах)-1E293B?logo=apple&logoColor=A2AAAD)](#2-поддерживаемые-платформы)
+[![iOS](https://img.shields.io/badge/Mobile-iOS_XCFramework-1E293B?logo=apple&logoColor=A2AAAD)](#2-поддерживаемые-платформы)
 <br/>
 [![SOCKS5](https://img.shields.io/badge/Протокол-SOCKS5-1E293B)](#3-технический-принцип-работы)
 [![MTProto](https://img.shields.io/badge/Протокол-MTProto_FakeTLS-1E293B?logo=telegram&logoColor=26A5E4)](#3-технический-принцип-работы)
@@ -57,9 +58,9 @@
 
 ## 1. Что такое mirrlyengine
 
-**`mirrlyengine`** — единое кроссплатформенное прокси-ядро на Rust (`Tokio` + `rustls` + `ring`) для клиентских приложений и шлюзов экосистемы Mirrly на **ПК (`Windows`, `Linux`)**, **Android** и **в будущем iOS**.
+**`mirrlyengine`** — единое кроссплатформенное прокси-ядро на Rust (`Tokio` + `rustls` + `ring`) для клиентских приложений и системных служб экосистемы Mirrly на **Windows**, **Linux**, **macOS**, **iOS** и **Android**.
 
-Библиотека встраивается напрямую в процесс приложения (через `C-FFI` или `JNI`) либо работает как локальный прокси-контур на `127.0.0.1`, принимая соединения от клиента Telegram без необходимости поднимать системный VPN или получать root-права.
+Библиотека встраивается напрямую в процесс приложения (через [include/mirrlyengine.h](include/mirrlyengine.h) по `C-FFI`, через `JNI` на Android или как Rust-крейт `rlib`), поднимая локальные шлюзы на `127.0.0.1` (включая эфемерный порт `0`) без необходимости получать root-права.
 
 ### Ключевые возможности
 * **Два локальных шлюза**:
@@ -77,16 +78,19 @@
 
 ## 2. Поддерживаемые платформы
 
-Ядро собирается в виде динамической или статической библиотеки (`crate-type = ["cdylib", "rlib"]`) без платформенно-жёстких зависимостей в сетевом стеке:
+Ядро собирается в виде динамической, статической или Rust-библиотеки (`crate-type = ["cdylib", "staticlib", "rlib"]`) без внешних C-зависимостей для TLS (`rustls` + `ring` + `webpki-roots`):
 
 | Платформа | Статус | Целевой формат | Интерфейс | Целевые таргеты Rust |
 | :--- | :--- | :--- | :--- | :--- |
-| **Windows** | Поддерживается | `.dll` / `.lib` (`cdylib`, `rlib`) | `C-FFI` | `x86_64-pc-windows-msvc` |
-| **Linux** | Поддерживается | `.so` / `.rlib` (`cdylib`, `rlib`) | `C-FFI` | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` |
+| **Windows** | Поддерживается | `.dll` / `.dll.lib` / `.lib` / `.rlib` | `C-FFI` ([mirrlyengine.h](include/mirrlyengine.h)) | `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc` |
+| **Linux** | Поддерживается | `.so` / `.a` / `.rlib` | `C-FFI` ([mirrlyengine.h](include/mirrlyengine.h)) | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` |
+| **macOS** | Поддерживается | `.dylib` / `.a` / `.rlib` | `C-FFI` (`Swift` / `Obj-C` / `C++`) | `aarch64-apple-darwin`, `x86_64-apple-darwin` |
+| **iOS** | Поддерживается | `.a` / `XCFramework` (`staticlib`) | `C-FFI` ([module.modulemap](include/module.modulemap)) | `aarch64-apple-ios`, `aarch64-apple-ios-sim`, `x86_64-apple-ios` |
 | **Android** | Поддерживается | `libmirrlyengine.so` (`cdylib`) | `JNI` + `C-FFI` | `aarch64-linux-android`, `armv7-linux-androideabi`, `x86_64-linux-android` |
-| **iOS** | В планах | `.a` / `XCFramework` (`staticlib`) | `C-FFI` | `aarch64-apple-ios`, `aarch64-apple-ios-sim` |
 
-> Для 64-битных целей Android (`aarch64`, `x86_64`) в [.cargo/config.toml](.cargo/config.toml) включён флаг линковки `-Wl,-z,max-page-size=16384` для совместимости с 16 KB страницами памяти.
+> * Для 64-битных целей Android в [.cargo/config.toml](.cargo/config.toml) включены `-Wl,-z,max-page-size=16384` и `--build-id=sha1`.
+> * На `macOS` и `iOS` сокеты автоматически защищаются от `SIGPIPE` (`SO_NOSIGPIPE`), чтобы встроенный `staticlib`/`dylib` не завершал хост-приложение при разрыве соединения.
+> * Принудительный `TCP_MAXSEG = 1240` применяется только при активном мобильном/лимитируемом профиле сети и не режет широкополосные десктопные каналы.
 
 ---
 
@@ -109,21 +113,21 @@
 ```mermaid
 flowchart TD
     subgraph Clients ["1. Клиентские приложения"]
-        PC["ПК: Windows / Linux\n(C++ / Qt, CLI / Service)"]
+        PC["ПК: Windows / Linux / macOS\n(C++ / Qt, Swift, CLI / Service)"]
         AND["Android\n(MirrlyGram / Mirrly TG Proxy)"]
-        IOS["iOS (В планах)\n(Swift / Obj-C)"]
+        IOS["iOS\n(Swift / NetworkExtension)"]
     end
 
     subgraph RustCore ["2. Универсальное ядро mirrlyengine (Rust / Tokio)"]
-        ABI["C-FFI (extern 'C') & Android JNI"]
+        ABI["C-FFI (mirrlyengine.h) & Android JNI"]
         Gateway{"Локальный шлюз 127.0.0.1"}
         SOCKS["SOCKS5 Server\n(socks5.rs)"]
         MTP["MTProto Server\n(proxy.rs / faketls.rs)"]
-        NetStack["Balancer • Budget • Recovery • Happy Eyeballs\nDoH Resolver • TLS Split (chrome124)\nNetwork Generation Guard • TrafficGuard"]
+        NetStack["Balancer • Budget • Recovery • Happy Eyeballs\nDoH Resolver • TLS Split (chrome124)\nNetwork Generation Guard • Platform Adapter"]
 
         PC -->|"C-FFI + локальный сокет"| ABI
         AND -->|"JNI / C-FFI + локальный сокет"| ABI
-        IOS -.->|"C-FFI (план)"| ABI
+        IOS -->|"C-FFI (staticlib / XCFramework)"| ABI
 
         ABI --> Gateway
         Gateway -->|"SOCKS5"| SOCKS
@@ -147,18 +151,19 @@ flowchart TD
 
 ## 5. C-FFI и JNI-интерфейс
 
-Все публичные функции экспортируются с `#[no_mangle]` в [src/lib.rs](src/lib.rs) и [src/traffic_guard.rs](src/traffic_guard.rs). Строки, возвращаемые в `*mut c_char`, освобождаются на стороне вызывающего кода через `FreeString`.
+Все публичные функции объявлены в едином заголовке [include/mirrlyengine.h](include/mirrlyengine.h) (и [include/module.modulemap](include/module.modulemap) для Swift / Xcode) и экспортируются с `#[no_mangle]` в [src/lib.rs](src/lib.rs). Строки, возвращаемые в `*mut c_char`, освобождаются на стороне вызывающего кода через `FreeString`.
 
 | Категория | Ключевые функции `C-FFI` | Назначение |
 | :--- | :--- | :--- |
-| **Жизненный цикл** | `StartProxy`, `StartSocks5Proxy`, `StopProxy`, `StopMtprotoProxy`, `StopSocks5Proxy` | Запуск и остановка локальных серверов `MTProto` и `SOCKS5` |
+| **Жизненный цикл и порты** | `StartProxy`, `StartSocks5Proxy`, `GetMtprotoListenPort`, `GetSocks5ListenPort`, `StopProxy`, `StopMtprotoProxy`, `StopSocks5Proxy` | Запуск (включая `port = 0`), чтение выданного порта и остановка локальных серверов |
+| **Рантайм и логи** | `SetRuntimeWorkerThreads`, `SetLogCallback` | Лимит потоков Tokio (например, для iOS `NetworkExtension`) и перехват логов в GUI/клиенте |
 | **Сеть и сокеты** | `ResetNetworkSockets`, `EmergencyKillAllSockets`, `SuspendNetworkSockets`, `WarmupWsPool`, `OnScreenWakeup` | Сброс зависших сокетов, прогрев `WsPool`, реакции на сон/пробуждение |
-| **Профиль и пул** | `SetNetworkProfile`, `SetNetworkGeneration`, `SetPoolSize`, `SetMtprotoStandbyPerActiveSlot`, `SetSocketBufferSizes` | Переключение Wi-Fi/Mobile, смена поколения сети, тюнинг буферов и пула |
+| **Профиль и пул** | `SetNetworkProfile`, `SetNetworkProfileJson`, `SetNetworkGeneration`, `SetPoolSize`, `SetMtprotoStandbyPerActiveSlot`, `SetSocketBufferSizes`, `SetMaxSocketBufferCeiling` | Переключение профиля, смена поколения сети, тюнинг буферов (до 8 МБ) и пула |
 | **TLS и SOCKS5** | `SetTlsEnabled`, `SetTlsClientHelloSplitEnabled`, `SetTlsRecordPaddingEnabled`, `SetSocks5Auth`, `SetSocks5Optimistic`, `SetSocks5UplinkMode` | Управление внешним TLS, фрагментацией, авторизацией и режимом SOCKS5 |
 | **Anycast / Worker** | `SetCfProxyConfig`, `PromoteCfproxyDomainForDc`, `SetSecret` | Настройка домена Cloudflare Worker, продвижение CDN-домена, смена секрета |
 | **Телеметрия** | `GetStatsJson`, `GetTransportPoolStatusJson`, `GetDomainBalancerStatusJson`, `GetDialBudgetStatsJson`, `GetTlsObservabilityStatusJson`, `FreeString` | Снятие JSON-метрик состояния ядра и освобождение C-строк |
 
-Для Android дополнительно экспортируются нативные методы `Java_org_telegram_messenger_mirrly_MirrlyEngineController_*` для прямой работы без прослойки JNA.
+Для Android (а также при сборке с `--features jni`) дополнительно компилируются нативные методы `Java_org_telegram_messenger_mirrly_MirrlyEngineController_*`; в десктопных и iOS-артефактах они не экспортируются.
 
 ---
 
@@ -169,7 +174,12 @@ flowchart TD
 ```text
 mirrlyengine/
 ├── .cargo/
-│   └── config.toml                # Флаги линковки Android (16 KB alignment для aarch64/x86_64)
+│   └── config.toml                # Флаги линковки Android (16 KB alignment + build-id)
+├── .github/
+│   └── workflows/ci.yml           # Кросс-платформенный CI (Windows, Linux, macOS, iOS, Android)
+├── include/
+│   ├── mirrlyengine.h             # Заголовок C / C++ / Swift для C-FFI
+│   └── module.modulemap           # Описание модуля Apple для XCFramework
 ├── src/
 │   ├── balancer.rs                # Балансировка доменов по дата-центрам и поколениям сети
 │   ├── bridge.rs                  # Мост двунаправленной передачи потоков и дренаж
@@ -179,17 +189,17 @@ mirrlyengine/
 │   ├── crypto.rs                  # Криптография Obfuscated2 и потоковый сплиттер
 │   ├── faketls.rs                 # FakeTLS маскировка и разбор фреймов
 │   ├── generation_guard.rs        # Защита от гонок при смене поколений сети
-│   ├── lib.rs                     # Точка входа C-FFI, Tokio runtime и JNI-мост
+│   ├── lib.rs                     # Точка входа C-FFI, Tokio runtime и опциональный JNI-мост
 │   ├── network_profile.rs         # Профили сети и метрики SLI
 │   ├── node_independence.rs       # Оценка независимости узлов и колокаций
+│   ├── platform.rs                # Платформенный слой (логи, сокеты, дефолты для 5 ОС)
 │   ├── proxy.rs                   # Локальный MTProto-шлюз и пул WebSocket
 │   ├── recovery.rs                # Эскалация восстановления и карантин маршрутов
 │   ├── socks5.rs                  # Локальный SOCKS5-сервер (RFC 1928 / RFC 1929)
 │   ├── tls_observability.rs       # Телеметрия TLS-хэндшейков
-│   ├── traffic_guard.rs           # Проверка целостности и состояния безопасности
 │   └── ws.rs                      # WebSocket-транспорт и фрагментация ClientHello
-├── tests/                         # 14 наборов интеграционных и контрактных тестов
-├── Cargo.toml                     # Манифест крейта (edition = "2021", cdylib + rlib)
+├── tests/                         # Интеграционные и контрактные тесты
+├── Cargo.toml                     # Манифест крейта (edition = "2021", cdylib + staticlib + rlib)
 ├── Cargo.lock                     # Зафиксированные версии зависимостей
 ├── LICENSE                        # GNU GPLv3
 └── README.md
@@ -200,6 +210,7 @@ mirrlyengine/
 * **Rust Toolchain**: `rustc` / `cargo` (MSRV под `edition = "2021"`, проверено на `1.97.1`)
 * **Windows**: Visual Studio / Build Tools C++ (`MSVC x64`, запуск из среды `vcvars64.bat` или `Developer Command Prompt`)
 * **Linux**: стандартный тулчейн `gcc` / `clang` и `libc-dev`
+* **macOS / iOS**: Xcode + Command Line Tools, таргеты `aarch64-apple-darwin`, `x86_64-apple-darwin`, `aarch64-apple-ios`, `aarch64-apple-ios-sim`
 * **Android**: `cargo-ndk` + Android NDK и таргеты `aarch64-linux-android`, `armv7-linux-androideabi`, `x86_64-linux-android`
 
 ### Команды сборки и тестирования
@@ -208,11 +219,19 @@ mirrlyengine/
 # Модульные и интеграционные тесты на текущей платформе
 cargo test
 
-# Сборка релизной библиотеки под ПК (Windows .dll/.lib или Linux .so)
+# Сборка релизной библиотеки под ПК (Windows .dll/.lib, Linux .so/.a, macOS .dylib/.a)
 cargo build --release
 
+# Сборка XCFramework для iOS (на macOS)
+cargo build --release --target aarch64-apple-ios
+cargo build --release --target aarch64-apple-ios-sim
+xcodebuild -create-xcframework \
+  -library target/aarch64-apple-ios/release/libmirrlyengine.a -headers include \
+  -library target/aarch64-apple-ios-sim/release/libmirrlyengine.a -headers include \
+  -output target/MirrlyEngine.xcframework
+
 # Сборка под Android (запускать из корня репозитория, чтобы применялся .cargo/config.toml)
-cargo ndk -t arm64-v8a -t armeabi-v7a -p 23 build --release
+cargo ndk -t arm64-v8a -t armeabi-v7a --platform 23 build --release
 ```
 
 ---
@@ -220,7 +239,7 @@ cargo ndk -t arm64-v8a -t armeabi-v7a -p 23 build --release
 ## 7. Безопасность, приватность и лицензия
 
 * **Локальная работа**: ядро обрабатывает трафик локально на устройстве и не отправляет стороннюю телеметрию на внешние серверы.
-* **Встроенный контроль состояния**: модуль [src/traffic_guard.rs](src/traffic_guard.rs) отвечает за проверку окружения и отчётность состояния безопасности (`GetEngineSecurityState`, `GetSecurityPostureReportJson`).
+* **Открытый и переносимый код**: ядро не содержит платформенно-завязанных проверок подписи или скрытых блокировок и работает единообразно на десктопах и мобильных устройствах.
 * **Лицензия**: проект распространяется на условиях `GNU General Public License v3` (см. [LICENSE](LICENSE)).
 
 ---
