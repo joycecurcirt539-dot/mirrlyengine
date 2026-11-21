@@ -1,12 +1,10 @@
 use crate::config::*;
-use crate::ws::{
-    is_http_status_error, ws_connect_happy_eyeballs, RawWebSocket,
-    WsError,
-};
-use std::net::{IpAddr, SocketAddr};
+use crate::ws::{is_http_status_error, server_name, RawWebSocket, WsError, TLS_CONFIG_CHROME};
 use once_cell::sync::Lazy;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
@@ -71,7 +69,7 @@ pub fn decode_cf_domain(s: &str) -> String {
     };
 
     if let Some(base) = open_base {
-        if FLOWSEAL_OPEN_BASES.iter().any(|&b| b == base) {
+        if FLOWSEAL_OPEN_BASES.contains(&base) {
             return format!("{}.co.uk", base);
         }
     }
@@ -81,16 +79,16 @@ pub fn decode_cf_domain(s: &str) -> String {
         let p = &stripped[..stripped.len() - 4];
         let mut n = 0i32;
         for c in p.chars() {
-            if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+            if c.is_ascii_alphabetic() {
                 n += 1;
             }
         }
         let mut result: Vec<u8> = Vec::new();
         for &c in p.as_bytes() {
-            if c >= b'a' && c <= b'z' {
+            if c.is_ascii_lowercase() {
                 let v = (((c - b'a') as i32 - n % 26 + 26) % 26) as u8 + b'a';
                 result.push(v);
-            } else if c >= b'A' && c <= b'Z' {
+            } else if c.is_ascii_uppercase() {
                 let v = (((c - b'A') as i32 - n % 26 + 26) % 26) as u8 + b'A';
                 result.push(v);
             } else {
@@ -268,12 +266,6 @@ pub fn reset_cfproxy_429_hits(scope: ProtoScope) {
     }
 }
 
-pub fn clear_all_cfproxy_429_hits() {
-    MTPROTO_429_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
-    SOCKS5_429_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
-    GLOBAL_429_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
-}
-
 pub fn cfproxy_429_strikes_scoped(domain: &str, scope: ProtoScope) -> i32 {
     let key = scoped_cfproxy_cooldown_key(domain, scope);
     if key.is_empty() {
@@ -284,36 +276,6 @@ pub fn cfproxy_429_strikes_scoped(domain: &str, scope: ProtoScope) -> i32 {
         .filter(|state| state.until.map(|u| u > Instant::now()).unwrap_or(false))
         .map(|state| state.strikes)
         .unwrap_or(0)
-}
-
-pub fn cfproxy_429_strikes(domain: &str) -> i32 {
-    let m = cfproxy_429_strikes_scoped(domain, ProtoScope::Mtproto);
-    let s = cfproxy_429_strikes_scoped(domain, ProtoScope::Socks5);
-    let g = cfproxy_429_strikes_scoped(domain, ProtoScope::Global);
-    g.max(m).max(s)
-}
-
-pub fn cfproxy_429_active_count_scoped(scope: ProtoScope) -> usize {
-    let now = Instant::now();
-    let map = CFPROXY_429.read();
-    let prefix = scope.prefix();
-    map.iter()
-        .filter(|(k, v)| {
-            let matches_scope = match scope {
-                ProtoScope::Global => !k.starts_with("mtproto:") && !k.starts_with("socks5:"),
-                ProtoScope::Mtproto | ProtoScope::Socks5 => k.starts_with(prefix),
-            };
-            matches_scope && v.until.map(|u| u > now).unwrap_or(false)
-        })
-        .count()
-}
-
-pub fn cfproxy_429_active_count() -> usize {
-    let now = Instant::now();
-    let map = CFPROXY_429.read();
-    map.values()
-        .filter(|v| v.until.map(|u| u > now).unwrap_or(false))
-        .count()
 }
 
 pub fn clear_cfproxy_429_cooldowns() {
@@ -543,15 +505,6 @@ pub fn release_cfproxy_half_open_trial(domain: &str) {
     }
 }
 
-pub type CfproxyAttemptPermit = crate::budget::DialPermit;
-
-pub async fn acquire_cfproxy_attempt_slot() -> Option<CfproxyAttemptPermit> {
-    crate::budget::DIAL_BUDGET
-        .acquire(crate::budget::FlowCategory::UserFlow, None)
-        .await
-        .ok()
-}
-
 // ---------------------------------------------------------------------------
 // Cache files
 // ---------------------------------------------------------------------------
@@ -658,39 +611,164 @@ pub fn start_cfproxy_refresh() {
     });
 }
 
-static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .build()
-        .unwrap_or_default()
-});
+fn decode_chunked_body(data: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let line_end = data[pos..].windows(2).position(|w| w == b"\r\n")?;
+        let size_line = std::str::from_utf8(&data[pos..pos + line_end]).ok()?;
+        let hex_len = size_line.split(';').next()?.trim();
+        let chunk_len = usize::from_str_radix(hex_len, 16).ok()?;
+        pos += line_end + 2;
+        if chunk_len == 0 {
+            return Some(out);
+        }
+        if pos + chunk_len > data.len() {
+            return None;
+        }
+        out.extend_from_slice(&data[pos..pos + chunk_len]);
+        pos += chunk_len;
+        if data.get(pos..pos + 2) == Some(b"\r\n") {
+            pos += 2;
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
+const MAX_HTTP_FETCH_BYTES: usize = 256 * 1024;
+
+fn parse_http_text_response(raw: &[u8]) -> Result<String, String> {
+    let hdr_end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| "invalid HTTP response headers".to_string())?;
+    let hdr_str = std::str::from_utf8(&raw[..hdr_end]).map_err(|e| e.to_string())?;
+    let mut lines = hdr_str.lines();
+    let status_line = lines.next().ok_or_else(|| "empty HTTP status".to_string())?;
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if status != 200 {
+        return Err(format!("HTTP {}", status));
+    }
+
+    let mut is_chunked = false;
+    let mut content_len: Option<usize> = None;
+    for line in lines {
+        if let Some((name, val)) = line.split_once(':') {
+            let k = name.trim().to_ascii_lowercase();
+            let v = val.trim().to_ascii_lowercase();
+            if k == "transfer-encoding" && v.contains("chunked") {
+                is_chunked = true;
+            } else if k == "content-length" {
+                content_len = v.parse().ok();
+            }
+        }
+    }
+
+    let body_raw = &raw[hdr_end + 4..];
+    let body = if is_chunked {
+        decode_chunked_body(body_raw).ok_or_else(|| "truncated chunked body".to_string())?
+    } else if let Some(len) = content_len {
+        if body_raw.len() < len {
+            return Err("truncated Content-Length body".to_string());
+        }
+        body_raw[..len].to_vec()
+    } else if raw.len() >= MAX_HTTP_FETCH_BYTES {
+        return Err("HTTP response exceeded max size".to_string());
+    } else {
+        body_raw.to_vec()
+    };
+
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+async fn fetch_https_text(url_str: &str, timeout: Duration) -> Result<String, String> {
+    let parsed = url::Url::parse(url_str).map_err(|e| e.to_string())?;
+    if parsed.scheme() != "https" {
+        return Err("only https URLs are supported".to_string());
+    }
+    let host = parsed.host_str().ok_or("missing URL host")?.to_string();
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let mut target = parsed.path().to_string();
+    if target.is_empty() {
+        target.push('/');
+    }
+    if let Some(q) = parsed.query() {
+        target.push('?');
+        target.push_str(q);
+    }
+
+    tokio::time::timeout(timeout, async move {
+        let resolved_ips: Vec<IpAddr> = tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .map_err(|e| e.to_string())?
+            .map(|sa| sa.ip())
+            .collect();
+        let (v4, v6): (Vec<IpAddr>, Vec<IpAddr>) =
+            resolved_ips.into_iter().partition(|ip| ip.is_ipv4());
+        let ordered_ips = crate::network_profile::filter_ip_family(interleave_dual_stack_ips(v6, v4));
+        if ordered_ips.is_empty() {
+            return Err("DNS returned no usable addresses".to_string());
+        }
+
+        let mut connected = None;
+        let mut last_err = None;
+        for ip in ordered_ips {
+            let addr = SocketAddr::new(ip, port);
+            match tokio::time::timeout(Duration::from_secs(3), tokio::net::TcpStream::connect(addr)).await {
+                Ok(Ok(s)) => {
+                    connected = Some(s);
+                    break;
+                }
+                Ok(Err(e)) => last_err = Some(e.to_string()),
+                Err(_) => last_err = Some("TCP connect timeout".to_string()),
+            }
+        }
+        let tcp = connected.ok_or_else(|| last_err.unwrap_or_else(|| "TCP connect failed".to_string()))?;
+        crate::platform::configure_socket_platform(&socket2::SockRef::from(&tcp));
+
+        let connector = tokio_rustls::TlsConnector::from(TLS_CONFIG_CHROME.clone());
+        let mut tls = connector
+            .connect(server_name(&host), tcp)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let req = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Mozilla/5.0 tg-ws-proxy-android\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
+            target, host
+        );
+        tls.write_all(req.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        tls.flush().await.map_err(|e| e.to_string())?;
+
+        let mut raw = Vec::new();
+        let mut limited = (&mut tls).take(MAX_HTTP_FETCH_BYTES as u64);
+        limited
+            .read_to_end(&mut raw)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        parse_http_text_response(&raw)
+    })
+    .await
+    .map_err(|_| "HTTP request timeout".to_string())?
+}
 
 pub async fn try_refresh_cfproxy_domains() -> bool {
     if !crate::ws::is_tls_enabled() {
         return false;
     }
     let expected = crate::generation_guard::snapshot();
-    let resp = match HTTP_CLIENT
-        .get(CFPROXY_DOMAINS_URL)
-        .header("User-Agent", "Mozilla/5.0 tg-ws-proxy-android")
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            ldebug!(" CF: GitHub недоступен: {}", e);
-            return false;
-        }
-    };
-    if resp.status().as_u16() != 200 {
-        ldebug!(" CF: GitHub вернул {}", resp.status().as_u16());
-        return false;
-    }
-    let body = match resp.text().await {
+    let body = match fetch_https_text(CFPROXY_DOMAINS_URL, Duration::from_secs(8)).await {
         Ok(b) => b,
         Err(e) => {
-            ldebug!(" CF: список доменов прочитать не удалось: {}", e);
+            ldebug!(" CF: GitHub недоступен: {}", e);
             return false;
         }
     };
@@ -768,37 +846,10 @@ pub fn interleave_dual_stack_ips(v6: Vec<IpAddr>, v4: Vec<IpAddr>) -> Vec<IpAddr
     interleaved
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AddressFamily {
-    Ipv4,
-    Ipv6,
-    DualStack,
-    None,
-}
-
-impl AddressFamily {
-    pub fn from_ips(ips: &[IpAddr]) -> Self {
-        if ips.is_empty() {
-            return AddressFamily::None;
-        }
-        let has_v4 = ips.iter().any(|ip| ip.is_ipv4());
-        let has_v6 = ips.iter().any(|ip| ip.is_ipv6());
-        match (has_v4, has_v6) {
-            (true, true) => AddressFamily::DualStack,
-            (true, false) => AddressFamily::Ipv4,
-            (false, true) => AddressFamily::Ipv6,
-            (false, false) => AddressFamily::None,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct CfDohCacheEntry {
     pub ips: Vec<IpAddr>,
     pub expires_at: Instant,
-    pub is_negative: bool,
-    pub family: AddressFamily,
-    pub resolver_source: String,
     pub network_generation: u64,
 }
 
@@ -873,16 +924,12 @@ pub fn cache_resolved_ips_if_current(
     domain: &str,
     ips: Vec<IpAddr>,
 ) -> bool {
-    let fam = AddressFamily::from_ips(&ips);
     crate::generation_guard::apply_if_current(expected, || {
         DOH_CACHE.write().insert(
             domain.to_string(),
             CfDohCacheEntry {
                 ips,
                 expires_at: Instant::now() + Duration::from_secs(300),
-                is_negative: false,
-                family: fam,
-                resolver_source: "DoH".to_string(),
                 network_generation: expected.network,
             },
         );
@@ -893,7 +940,7 @@ pub fn cache_resolved_ips_if_current(
 pub fn cached_resolved_ips(domain: &str) -> Option<Vec<IpAddr>> {
     let cur_gen = crate::network_profile::current_generation();
     let entry = DOH_CACHE.read().get(domain)?.clone();
-    if Instant::now() < entry.expires_at && entry.network_generation == cur_gen && !entry.is_negative && !entry.ips.is_empty() {
+    if Instant::now() < entry.expires_at && entry.network_generation == cur_gen && !entry.ips.is_empty() {
         Some(entry.ips)
     } else {
         None
@@ -981,13 +1028,8 @@ pub async fn resolve_dual_stack_ips(domain: &str) -> Vec<IpAddr> {
     // 2. Cache hit (0 ms)
     let cur_gen = crate::network_profile::current_generation();
     if let Some(entry) = DOH_CACHE.read().get(domain).cloned() {
-        if Instant::now() < entry.expires_at && entry.network_generation == cur_gen {
-            if entry.is_negative {
-                return Vec::new();
-            }
-            if !entry.ips.is_empty() {
-                return crate::network_profile::filter_ip_family(entry.ips);
-            }
+        if Instant::now() < entry.expires_at && entry.network_generation == cur_gen && !entry.ips.is_empty() {
+            return crate::network_profile::filter_ip_family(entry.ips);
         }
     }
 
@@ -1040,64 +1082,9 @@ async fn resolve_dual_stack_ips_uncached(
     anycast
 }
 
-pub async fn resolve_clean_dual_stack_ips(domain: &str) -> Vec<IpAddr> {
-    let domain = domain.trim();
-    if domain.is_empty() {
-        return Vec::new();
-    }
-    if let Ok(ip) = domain.parse::<IpAddr>() {
-        return vec![ip];
-    }
-    let ips = resolve_dual_stack_ips(domain).await;
-    if !crate::config::is_cloudflare_domain(domain) {
-        let anycast = default_cf_anycast_dual_stack();
-        ips.into_iter().filter(|ip| !anycast.contains(ip)).collect()
-    } else {
-        ips
-    }
-}
-
-pub async fn resolve_doh(domain: &str) -> Option<String> {
-    let ips = resolve_dual_stack_ips(domain).await;
-    ips.first().map(|ip| ip.to_string())
-}
-
 // ---------------------------------------------------------------------------
 // cfConnectDomain (RFC 8305 Happy Eyeballs Dual-Stack Connection)
 // ---------------------------------------------------------------------------
-
-pub async fn cf_connect_domain(
-    domain: &str,
-    path: &str,
-    timeout: f64,
-) -> (Option<RawWebSocket>, String, Option<WsError>) {
-    cf_connect_domain_with_category(
-        domain,
-        path,
-        None,
-        timeout,
-        crate::budget::FlowCategory::UserFlow,
-        None,
-    )
-    .await
-}
-
-pub async fn cf_connect_domain_ext(
-    domain: &str,
-    path: &str,
-    early_data: Option<&[u8]>,
-    timeout: f64,
-) -> (Option<RawWebSocket>, String, Option<WsError>) {
-    cf_connect_domain_with_category(
-        domain,
-        path,
-        early_data,
-        timeout,
-        crate::budget::FlowCategory::UserFlow,
-        None,
-    )
-    .await
-}
 
 pub async fn cf_connect_domain_with_category(
     domain: &str,
@@ -1256,178 +1243,6 @@ pub async fn cf_connect_domain_with_category(
     result
 }
 
-pub async fn cf_connect_fronted(
-    server_address: &str,
-    server_port: u16,
-    tls_sni: &str,
-    host_header: &str,
-    path: &str,
-    timeout: f64,
-) -> (Option<RawWebSocket>, String, Option<WsError>) {
-    cf_connect_fronted_ext(
-        server_address,
-        server_port,
-        tls_sni,
-        host_header,
-        path,
-        None,
-        timeout,
-    )
-    .await
-}
-
-pub async fn cf_connect_fronted_ext(
-    server_address: &str,
-    server_port: u16,
-    tls_sni: &str,
-    host_header: &str,
-    path: &str,
-    early_data: Option<&[u8]>,
-    timeout: f64,
-) -> (Option<RawWebSocket>, String, Option<WsError>) {
-    let expected = crate::generation_guard::snapshot();
-    let path = if path.is_empty() {
-        "/apiws"
-    } else {
-        path
-    };
-    let is_mobile = MOBILE_NETWORK.load(std::sync::atomic::Ordering::Relaxed);
-    let dial_timeout = crate::config::adaptive_dial_timeout(is_mobile);
-    let attempt_timeout = crate::ws::ws_connect_timeout(timeout);
-    let phase_timeout = if path.starts_with("/tcp") {
-        attempt_timeout
-    } else {
-        attempt_timeout.max(dial_timeout)
-    };
-
-    let default_port = crate::ws::default_ws_port();
-    let server_addr_trimmed = server_address.trim();
-    let (parsed_host, target_port) = if let Ok(sa) = server_addr_trimmed.parse::<SocketAddr>() {
-        (
-            sa.ip().to_string(),
-            if server_port > 0 {
-                server_port
-            } else {
-                sa.port()
-            },
-        )
-    } else if let Ok(ip) = server_addr_trimmed.parse::<IpAddr>() {
-        (
-            ip.to_string(),
-            if server_port > 0 { server_port } else { default_port },
-        )
-    } else if let Some(colon) = server_addr_trimmed.rfind(':') {
-        if !server_addr_trimmed.starts_with('[')
-            && server_addr_trimmed.chars().filter(|c| *c == ':').count() == 1
-        {
-            let h = &server_addr_trimmed[..colon];
-            let p = server_addr_trimmed[colon + 1..]
-                .parse::<u16>()
-                .unwrap_or(default_port);
-            (h.to_string(), if server_port > 0 { server_port } else { p })
-        } else {
-            (
-                server_addr_trimmed.to_string(),
-                if server_port > 0 { server_port } else { default_port },
-            )
-        }
-    } else {
-        (
-            server_addr_trimmed.to_string(),
-            if server_port > 0 { server_port } else { default_port },
-        )
-    };
-
-    let (candidate_addrs, is_anycast_fallback): (Vec<SocketAddr>, bool) = if let Ok(ip) = parsed_host.parse::<IpAddr>() {
-        (vec![SocketAddr::new(ip, target_port)], false)
-    } else {
-        let domain_to_resolve = if parsed_host.is_empty() {
-            tls_sni.trim()
-        } else {
-            &parsed_host
-        };
-        let ips = resolve_dual_stack_ips(domain_to_resolve).await;
-        let is_fb = if crate::config::is_cloudflare_domain(domain_to_resolve) {
-            let anycast = default_cf_anycast_dual_stack();
-            !ips.is_empty() && ips.iter().all(|ip| anycast.contains(ip))
-        } else {
-            false
-        };
-        (ips.into_iter().map(|ip| SocketAddr::new(ip, target_port)).collect(), is_fb)
-    };
-
-    if candidate_addrs.is_empty() {
-        crate::recovery::record_if_current(
-            expected,
-            tls_sni,
-            crate::recovery::RecoveryCause::DnsFailure,
-        );
-        return (
-            None,
-            String::new(),
-            Some(WsError::Other(
-                "dns_failed: no candidate addresses resolved".to_string(),
-            )),
-        );
-    }
-
-    ldebug!(
-        " CF fronted dial server={}:{} sni={} host={} with {} candidate addrs (fallback_ip={})",
-        server_addr_trimmed,
-        target_port,
-        tls_sni,
-        host_header,
-        candidate_addrs.len(),
-        is_anycast_fallback
-    );
-
-    let result = match crate::ws::ws_connect_happy_eyeballs_split_ext(
-        tls_sni,
-        host_header,
-        path,
-        early_data,
-        &candidate_addrs,
-        phase_timeout,
-    )
-    .await
-    {
-        Ok((ws, winner_addr)) => {
-            let dial_ip = winner_addr.ip().to_string();
-            ldebug!(
-                " CF fronted connected server={}:{} sni={} -> {}",
-                server_addr_trimmed,
-                target_port,
-                tls_sni,
-                dial_ip
-            );
-            (Some(ws), dial_ip, None)
-        }
-        Err(e) => {
-            if is_anycast_fallback {
-                crate::recovery::record_if_current(
-                    expected,
-                    tls_sni,
-                    crate::recovery::RecoveryCause::FallbackIpFailed,
-                );
-                (
-                    None,
-                    String::new(),
-                    Some(WsError::Other(format!("fallback_ip_failed: {}", e.compact()))),
-                )
-            } else {
-                (None, String::new(), Some(e))
-            }
-        }
-    };
-    if !crate::generation_guard::is_current(expected) {
-        if let Some(ws) = result.0 {
-            let _ = ws.close().await;
-        }
-        return (None, String::new(), Some(WsError::Canceled));
-    }
-    result
-}
-
 pub fn log_cf_conn_error(msg: &str, err: &WsError) {
     if let WsError::Io(e) = err {
         if e.kind() == std::io::ErrorKind::ConnectionReset {
@@ -1439,198 +1254,6 @@ pub fn log_cf_conn_error(msg: &str, err: &WsError) {
     } else {
         lerror!("{}", msg);
     }
-}
-
-// ---------------------------------------------------------------------------
-// Fast Anycast Race & Latency Prober (RFC 8305 Staggered Happy Eyeballs)
-// ---------------------------------------------------------------------------
-
-pub async fn probe_domain_latency(domain: &str, dc: i32, timeout: Duration) -> Option<u64> {
-    let base_domain = normalize_cf_domain(domain);
-    if base_domain.is_empty() {
-        return None;
-    }
-    if cfproxy_429_cooldown_remaining_scoped(&base_domain, ProtoScope::Mtproto) > Duration::ZERO {
-        return None;
-    }
-    let target_host = format!("kws{}.{}", dc, base_domain);
-    let candidate_ips = resolve_dual_stack_ips(&target_host).await;
-    let default_port = crate::ws::default_ws_port();
-    let candidate_addrs: Vec<SocketAddr> = candidate_ips
-        .into_iter()
-        .map(|ip| SocketAddr::new(ip, default_port))
-        .collect();
-
-    if candidate_addrs.is_empty() {
-        return None;
-    }
-
-    let start = Instant::now();
-
-    match ws_connect_happy_eyeballs(&target_host, "/apiws", &candidate_addrs, timeout).await {
-        Ok((ws, winner)) => {
-            let rtt = start.elapsed().as_millis() as u64;
-            let colo = ws.colo().to_string();
-            crate::node_independence::NODE_INDEPENDENCE_TRACKER
-                .write()
-                .record_node_handshake_success(&base_domain, winner.ip(), &colo);
-            tokio::spawn(async move {
-                let _ = ws.close().await;
-            });
-            Some(rtt)
-        }
-        Err(e) => {
-            crate::node_independence::NODE_INDEPENDENCE_TRACKER
-                .write()
-                .record_node_failure(&base_domain, None, None);
-            if is_http_status_error(&e, 429) {
-                mark_cfproxy_429_cooldown_scoped(&base_domain, ProtoScope::Mtproto, &e);
-            }
-            None
-        }
-    }
-}
-
-pub async fn race_rank_domains(dc: i32) {
-    let expected = crate::generation_guard::snapshot();
-    let domains = {
-        let cfg = CFPROXY.read();
-        if !cfg.user_domain.is_empty() {
-            return; // Custom user worker has 100% priority, skip public CDN race
-        }
-        if cfg.domains.is_empty() {
-            default_cfproxy_domains()
-        } else {
-            cfg.domains.clone()
-        }
-    };
-
-    if domains.is_empty() {
-        return;
-    }
-
-    ldebug!(
-        "Начало Fast Anycast Race для {} доменов (DC{})...",
-        domains.len(),
-        dc
-    );
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, u64)>(domains.len());
-    let mut handles = Vec::new();
-
-    let stagger_step = Duration::from_millis(100);
-    for (i, d) in domains.iter().enumerate() {
-        let domain = d.clone();
-        let tx = tx.clone();
-        let delay = stagger_step * (i as u32);
-
-        handles.push(tokio::spawn(async move {
-            if delay > Duration::ZERO {
-                tokio::time::sleep(delay).await;
-            }
-            let _permit = match crate::budget::DIAL_BUDGET
-                .acquire(crate::budget::FlowCategory::Background, None)
-                .await
-            {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-            if !crate::generation_guard::is_current(expected) {
-                return;
-            }
-            if let Some(latency_ms) = probe_domain_latency(&domain, dc, crate::config::adaptive_race_timeout()).await
-            {
-                let _ = tx.send((domain.clone(), latency_ms)).await;
-                let base = crate::balancer::normalize_domain(&domain);
-                crate::balancer::BALANCER.write().record_probe_rtt(
-                    crate::network_profile::current_generation(),
-                    dc,
-                    false,
-                    &base,
-                    latency_ms,
-                );
-            }
-        }));
-    }
-
-    drop(tx);
-
-    let race_deadline = tokio::time::sleep(Duration::from_millis(4000));
-    tokio::pin!(race_deadline);
-
-    let mut ranked = Vec::new();
-    let mut first_winner_set = false;
-
-    loop {
-        tokio::select! {
-            _ = &mut race_deadline => break,
-            msg = rx.recv() => {
-                match msg {
-                    Some((domain, latency_ms)) => {
-                        if !crate::generation_guard::is_current(expected) {
-                            break;
-                        }
-                        if !first_winner_set {
-                            let _ = crate::generation_guard::apply_if_current(expected, || {
-                                let mut balancer = crate::balancer::BALANCER.write();
-                                if balancer.get_active_domain_for_dc(dc, false).is_none() {
-                                    balancer.update_domain_for_dc(dc, false, &domain);
-                                    linfo!("Быстрый лидер гонки Anycast (DC{}, холодный старт): {} ({} ms)", dc, domain, latency_ms);
-                                }
-                            });
-                            first_winner_set = true;
-                        }
-                        ranked.push((domain, latency_ms));
-                    }
-                    None => break,
-                }
-            }
-        }
-    }
-
-    for h in handles {
-        h.abort();
-    }
-
-    if !ranked.is_empty() {
-        ranked.sort_by_key(|(_, l)| *l);
-        linfo!(
-            "Итоги Fast Anycast Race (DC{}, топ-3): {:?}",
-            dc,
-            ranked
-                .iter()
-                .take(3)
-                .map(|(d, l)| format!("{}: {}ms", d, l))
-                .collect::<Vec<_>>()
-        );
-        apply_ranked_domains_if_current(expected, dc, ranked);
-    }
-}
-
-pub fn apply_ranked_domains_if_current(
-    expected: crate::generation_guard::GenerationStamp,
-    dc: i32,
-    ranked: Vec<(String, u64)>,
-) -> bool {
-    crate::generation_guard::apply_if_current(expected, || {
-        crate::balancer::BALANCER
-            .write()
-            .update_ranked_domains_for_dc(dc, false, ranked);
-    })
-    .is_some()
-}
-
-pub async fn race_all_primary_dcs() {
-    // 1. Primary pair: DC2 (Core/Chats) & DC4 (Media/Files) in parallel
-    tokio::join!(race_rank_domains(2), race_rank_domains(4),);
-
-    // 2. Secondary DCs: DC5 (Asia) & DC1 (US) in parallel
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    tokio::join!(race_rank_domains(5), race_rank_domains(1),);
-}
-
-pub async fn start_background_balancer_loop(cancel_token: tokio_util::sync::CancellationToken) {
-    ldebug!("Balancer background loop started (on-demand mode; background racing disabled)");
-    cancel_token.cancelled().await;
 }
 
 #[cfg(test)]
@@ -1645,9 +1268,6 @@ mod tests {
             CfDohCacheEntry {
                 ips: vec![test_ip],
                 expires_at: Instant::now() + Duration::from_secs(300),
-                is_negative: false,
-                family: AddressFamily::Ipv4,
-                resolver_source: "DoH".to_string(),
                 network_generation: 1,
             },
         );
@@ -1837,5 +1457,20 @@ mod tests {
         assert!(!try_acquire_cfproxy_half_open_trial(domain, net_gen_2));
 
         clear_cfproxy_429_cooldowns();
+    }
+
+    #[test]
+    fn test_parse_http_text_response_variants() {
+        let fixed = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\npclead.comextra";
+        assert_eq!(parse_http_text_response(fixed).unwrap(), "pclead.com");
+
+        let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\npclead\r\n4\r\n.com\r\n0\r\n\r\n";
+        assert_eq!(parse_http_text_response(chunked).unwrap(), "pclead.com");
+
+        let not_found = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(parse_http_text_response(not_found).unwrap_err(), "HTTP 404");
+
+        let trunc = b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nshort";
+        assert!(parse_http_text_response(trunc).is_err());
     }
 }

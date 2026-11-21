@@ -1,14 +1,25 @@
 use mirrlyengine::balancer::BALANCER;
-use mirrlyengine::cfproxy::{
-    apply_ranked_domains_if_current, cache_resolved_ips_if_current, cached_resolved_ips,
-};
+use mirrlyengine::cfproxy::{cache_resolved_ips_if_current, cached_resolved_ips};
 use mirrlyengine::config::CFPROXY;
-use mirrlyengine::generation_guard::{change_config, snapshot};
+use mirrlyengine::generation_guard::{apply_if_current, change_config, snapshot};
 use mirrlyengine::network_profile::{apply_profile, get_profile};
 use mirrlyengine::recovery::{record_if_current, RecoveryCause};
 use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::Notify;
+
+fn apply_ranked_if_current(
+    expected: mirrlyengine::generation_guard::GenerationStamp,
+    dc: i32,
+    ranked: Vec<(String, u64)>,
+) -> bool {
+    apply_if_current(expected, || {
+        BALANCER
+            .write()
+            .update_ranked_domains_for_dc(dc, false, ranked);
+    })
+    .is_some()
+}
 
 #[tokio::test]
 async fn slow_result_a_cannot_rewrite_or_reset_generation_b() {
@@ -22,7 +33,7 @@ async fn slow_result_a_cannot_rewrite_or_reset_generation_b() {
     let late_a = tokio::spawn(async move {
         waiting.notified().await;
         let old_ip: IpAddr = "192.0.2.10".parse().unwrap();
-        let rank_applied = apply_ranked_domains_if_current(
+        let rank_applied = apply_ranked_if_current(
             a,
             DC,
             vec![("mob020-worker-a.example".to_string(), 1)],
@@ -63,7 +74,7 @@ async fn slow_result_a_cannot_rewrite_or_reset_generation_b() {
     apply_profile(same_network_new_profile);
     assert_eq!(snapshot().network, b.network);
     assert_ne!(snapshot().profile, b.profile);
-    assert!(!apply_ranked_domains_if_current(
+    assert!(!apply_ranked_if_current(
         b,
         DC,
         vec![("mob020-old-profile.example".to_string(), 1)],

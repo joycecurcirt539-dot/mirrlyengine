@@ -145,7 +145,7 @@ impl NetworkProfile {
             "IPV6_FIRST" => "IPV6_FIRST".to_string(),
             _ => "DUAL_STACK".to_string(),
         };
-        self.websocket_keep_alive_seconds = self.websocket_keep_alive_seconds.clamp(15, 60);
+        self.websocket_keep_alive_seconds = self.websocket_keep_alive_seconds.clamp(15, 120);
         self
     }
 }
@@ -295,5 +295,36 @@ mod tests {
         assert_eq!(updated.transport, original.transport);
         assert_eq!(updated.estimated_down_kbps, original.estimated_down_kbps);
         assert_eq!(updated.transport_sli, original.transport_sli);
+    }
+
+    #[test]
+    fn websocket_keep_alive_seconds_clamps_to_15_120_range() {
+        let below = NetworkProfile {
+            websocket_keep_alive_seconds: 5,
+            ..NetworkProfile::default()
+        }
+        .normalized();
+        assert_eq!(below.websocket_keep_alive_seconds, 15);
+
+        let mid = NetworkProfile {
+            websocket_keep_alive_seconds: 90,
+            ..NetworkProfile::default()
+        }
+        .normalized();
+        assert_eq!(mid.websocket_keep_alive_seconds, 90);
+
+        let max_valid = NetworkProfile {
+            websocket_keep_alive_seconds: 120,
+            ..NetworkProfile::default()
+        }
+        .normalized();
+        assert_eq!(max_valid.websocket_keep_alive_seconds, 120);
+
+        let above = NetworkProfile {
+            websocket_keep_alive_seconds: 300,
+            ..NetworkProfile::default()
+        }
+        .normalized();
+        assert_eq!(above.websocket_keep_alive_seconds, 120);
     }
 }

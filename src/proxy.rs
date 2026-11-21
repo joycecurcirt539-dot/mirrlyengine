@@ -56,6 +56,12 @@ pub struct SlotState {
     pub in_flight: AtomicUsize,
 }
 
+impl Default for SlotState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SlotState {
     pub fn new() -> Self {
         Self {
@@ -128,6 +134,18 @@ pub struct SlotDemand {
     pub last_requested: Instant,
     pub request_count: u64,
     pub useful_rx_count: u64,
+}
+
+/// Snapshot of MTProto standby WebSocket warm pool readiness across active DC slots.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct MtprotoWarmPoolStatus {
+    pub ready_total: usize,
+    pub target_total: usize,
+    pub in_flight_total: usize,
+    pub dc2_chat_ready: usize,
+    pub dc2_chat_target: usize,
+    pub dc2_media_ready: usize,
+    pub dc2_media_target: usize,
 }
 
 pub struct WsPool {
@@ -214,11 +232,11 @@ impl WsPool {
                 if useful >= 2 {
                     configured
                 } else {
-                    configured.min(2).max(1)
+                    configured.clamp(1, 2)
                 }
             } else if is_dc2_chat || is_dc2_media {
                 // Baseline pre-warm for DC2 chat and media on Wi-Fi: 1–2 ready sockets (up to configured)
-                configured.min(2).max(1)
+                configured.clamp(1, 2)
             } else {
                 0
             }
@@ -237,10 +255,6 @@ impl WsPool {
         w.entry(slot)
             .or_insert_with(|| Arc::new(SlotState::new()))
             .clone()
-    }
-
-    pub async fn get_slot(&self, slot: DcSlot) -> Arc<SlotState> {
-        self.get_slot_sync(slot)
     }
 
     pub async fn get(
@@ -277,6 +291,60 @@ impl WsPool {
         self.trigger_refill(slot, &state);
 
         res
+    }
+
+    /// Aggregates standby pool counts across active slots and baseline DC2 chat/media slots.
+    pub fn warm_pool_status(&self) -> MtprotoWarmPoolStatus {
+        let slots_vec: Vec<(DcSlot, Arc<SlotState>)> = {
+            let r = self.slots.read();
+            r.iter().map(|(k, v)| (*k, v.clone())).collect()
+        };
+
+        let mut seen_dc2_chat = false;
+        let mut seen_dc2_media = false;
+        let mut ready_total = 0usize;
+        let mut target_total = 0usize;
+        let mut in_flight_total = 0usize;
+        let mut dc2_chat_ready = 0usize;
+        let mut dc2_chat_target = 0usize;
+        let mut dc2_media_ready = 0usize;
+        let mut dc2_media_target = 0usize;
+
+        for (slot, state) in slots_vec {
+            let ready = state.ready_count();
+            let in_flight = state.in_flight.load(Ordering::Relaxed);
+            let target = self.target_size(slot);
+            ready_total += ready;
+            in_flight_total += in_flight;
+            target_total += target;
+            if slot.dc == 2 && slot.is_media == 0 {
+                seen_dc2_chat = true;
+                dc2_chat_ready = ready;
+                dc2_chat_target = target;
+            } else if slot.dc == 2 && slot.is_media != 0 {
+                seen_dc2_media = true;
+                dc2_media_ready = ready;
+                dc2_media_target = target;
+            }
+        }
+        if !seen_dc2_chat {
+            dc2_chat_target = self.target_size(DcSlot { dc: 2, is_media: 0 });
+            target_total += dc2_chat_target;
+        }
+        if !seen_dc2_media {
+            dc2_media_target = self.target_size(DcSlot { dc: 2, is_media: 1 });
+            target_total += dc2_media_target;
+        }
+
+        MtprotoWarmPoolStatus {
+            ready_total,
+            target_total,
+            in_flight_total,
+            dc2_chat_ready,
+            dc2_chat_target,
+            dc2_media_ready,
+            dc2_media_target,
+        }
     }
 
     pub fn trigger_refill(self: &Arc<Self>, slot: DcSlot, state: &Arc<SlotState>) {
@@ -799,11 +867,11 @@ pub async fn bridge_ws(
                 }
             } else {
                 let frames = splitter.process(&initial_clt_data, &mut clt_dec, &mut tg_enc);
-                if !frames.is_empty() {
-                    if !matches!(crate::bridge::bounded_io(ws_up.send_batch(&frames), &cancel_up, BRIDGE_WRITE_TIMEOUT).await, Ok(Ok(()))) {
-                        cancel_up.cancel();
-                        return;
-                    }
+                if !frames.is_empty()
+                    && !matches!(crate::bridge::bounded_io(ws_up.send_batch(&frames), &cancel_up, BRIDGE_WRITE_TIMEOUT).await, Ok(Ok(())))
+                {
+                    cancel_up.cancel();
+                    return;
                 }
             }
         }
@@ -843,10 +911,10 @@ pub async fn bridge_ws(
                 }
             } else {
                 let frames = splitter.process(&chunk_data, &mut clt_dec, &mut tg_enc);
-                if !frames.is_empty() {
-                    if !matches!(crate::bridge::bounded_io(ws_up.send_batch(&frames), &cancel_up, BRIDGE_WRITE_TIMEOUT).await, Ok(Ok(()))) {
-                        break;
-                    }
+                if !frames.is_empty()
+                    && !matches!(crate::bridge::bounded_io(ws_up.send_batch(&frames), &cancel_up, BRIDGE_WRITE_TIMEOUT).await, Ok(Ok(())))
+                {
+                    break;
                 }
             }
         }
@@ -854,10 +922,10 @@ pub async fn bridge_ws(
         if !clean_eof { cancel_up.cancel(); return; }
         if !is_worker {
             let tail = splitter.flush(&mut tg_enc);
-            if !tail.is_empty() {
-                if !matches!(crate::bridge::bounded_io(ws_up.send_batch(&tail), &cancel_up, BRIDGE_WRITE_TIMEOUT).await, Ok(Ok(()))) {
-                    cancel_up.cancel(); return;
-                }
+            if !tail.is_empty()
+                && !matches!(crate::bridge::bounded_io(ws_up.send_batch(&tail), &cancel_up, BRIDGE_WRITE_TIMEOUT).await, Ok(Ok(())))
+            {
+                cancel_up.cancel(); return;
             }
         }
 
@@ -1550,8 +1618,8 @@ pub async fn handle_client(
         if s == b"HEAD"
             || s == b"POST"
             || s == b"GET "
-            || s == &[0xee, 0xee, 0xee, 0xee]
-            || s == &[0xdd, 0xdd, 0xdd, 0xdd]
+            || s == [0xee, 0xee, 0xee, 0xee]
+            || s == [0xdd, 0xdd, 0xdd, 0xdd]
         {
             continue;
         }

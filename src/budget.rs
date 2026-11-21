@@ -186,6 +186,12 @@ pub struct DialBudgetManager {
     inner: Arc<DialBudgetInner>,
 }
 
+impl Default for DialBudgetManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DialBudgetManager {
     pub fn new() -> Self {
         Self {
@@ -466,6 +472,14 @@ impl<K: Eq + std::hash::Hash + Clone + Send + 'static, V: Clone + Send + 'static
 #[derive(Clone)]
 pub struct Singleflight<K: Eq + std::hash::Hash + Clone + Send + 'static, V: Clone + Send + 'static> {
     in_flight: Arc<parking_lot::Mutex<HashMap<K, watch::Receiver<Option<V>>>>>,
+}
+
+impl<K: Eq + std::hash::Hash + Clone + Send + 'static, V: Clone + Send + 'static> Default
+    for Singleflight<K, V>
+{
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<K: Eq + std::hash::Hash + Clone + Send + 'static, V: Clone + Send + 'static> Singleflight<K, V> {

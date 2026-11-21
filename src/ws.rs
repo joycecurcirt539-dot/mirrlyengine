@@ -39,7 +39,7 @@ use once_cell::sync::Lazy;
 
 /// Physical TCP/TLS attempts, dynamically throttled within [2 .. 8] based on radio quality.
 static ACTIVE_MOBILE_DIALS: AtomicUsize = AtomicUsize::new(0);
-static MOBILE_DIAL_NOTIFY: Lazy<tokio::sync::Notify> = Lazy::new(|| tokio::sync::Notify::new());
+static MOBILE_DIAL_NOTIFY: Lazy<tokio::sync::Notify> = Lazy::new(tokio::sync::Notify::new);
 
 pub struct MobileDialPermit;
 impl Drop for MobileDialPermit {
@@ -138,11 +138,177 @@ fn order_cipher_suites_for_profile(
     ordered
 }
 
+#[inline]
+fn max_tls13_record_pad(payload_len: usize) -> usize {
+    255usize.min(16384usize.saturating_sub(payload_len))
+}
+
+#[inline]
+fn choose_tls13_record_pad(payload_len: usize) -> usize {
+    let max_pad = max_tls13_record_pad(payload_len);
+    if max_pad == 0 {
+        return 0;
+    }
+    let min_pad = 16usize.min(max_pad);
+    let span = max_pad - min_pad + 1;
+    min_pad + (rand::RngCore::next_u32(&mut rand::thread_rng()) as usize % span)
+}
+
+struct PaddedTls13AeadAlgorithm {
+    inner: &'static dyn rustls::crypto::cipher::Tls13AeadAlgorithm,
+    ring_alg: &'static ring::aead::Algorithm,
+}
+
+impl rustls::crypto::cipher::Tls13AeadAlgorithm for PaddedTls13AeadAlgorithm {
+    fn encrypter(
+        &self,
+        key: rustls::crypto::cipher::AeadKey,
+        iv: rustls::crypto::cipher::Iv,
+    ) -> Box<dyn rustls::crypto::cipher::MessageEncrypter> {
+        if !is_tls_record_padding_enabled() {
+            return self.inner.encrypter(key, iv);
+        }
+        let unbound = ring::aead::UnboundKey::new(self.ring_alg, key.as_ref())
+            .expect("valid TLS 1.3 AEAD key length");
+        let enc_key = ring::aead::LessSafeKey::new(unbound);
+        let iv_bytes: [u8; 12] = iv.as_ref().try_into().expect("12-byte TLS 1.3 IV");
+        Box::new(PaddedTls13MessageEncrypter {
+            enc_key,
+            iv: rustls::crypto::cipher::Iv::from(iv_bytes),
+        })
+    }
+
+    fn decrypter(
+        &self,
+        key: rustls::crypto::cipher::AeadKey,
+        iv: rustls::crypto::cipher::Iv,
+    ) -> Box<dyn rustls::crypto::cipher::MessageDecrypter> {
+        self.inner.decrypter(key, iv)
+    }
+
+    fn key_len(&self) -> usize {
+        self.inner.key_len()
+    }
+
+    fn extract_keys(
+        &self,
+        key: rustls::crypto::cipher::AeadKey,
+        iv: rustls::crypto::cipher::Iv,
+    ) -> Result<rustls::ConnectionTrafficSecrets, rustls::crypto::cipher::UnsupportedOperationError> {
+        self.inner.extract_keys(key, iv)
+    }
+
+    fn fips(&self) -> bool {
+        self.inner.fips()
+    }
+}
+
+struct PaddedTls13MessageEncrypter {
+    enc_key: ring::aead::LessSafeKey,
+    iv: rustls::crypto::cipher::Iv,
+}
+
+impl rustls::crypto::cipher::MessageEncrypter for PaddedTls13MessageEncrypter {
+    fn encrypt(
+        &mut self,
+        msg: rustls::crypto::cipher::OutboundPlainMessage<'_>,
+        seq: u64,
+    ) -> Result<rustls::crypto::cipher::OutboundOpaqueMessage, rustls::Error> {
+        let payload_len = msg.payload.len();
+        let pad_len = choose_tls13_record_pad(payload_len);
+        let inner_len = payload_len + 1 + pad_len;
+        let total_len = inner_len + self.enc_key.algorithm().tag_len();
+        let mut payload = rustls::crypto::cipher::PrefixedPayload::with_capacity(total_len);
+
+        let nonce = ring::aead::Nonce::assume_unique_for_key(
+            rustls::crypto::cipher::Nonce::new(&self.iv, seq).0,
+        );
+        let aad = ring::aead::Aad::from(rustls::crypto::cipher::make_tls13_aad(total_len));
+        payload.extend_from_chunks(&msg.payload);
+        payload.extend_from_slice(&msg.typ.to_array());
+        if pad_len > 0 {
+            let zeros = [0u8; 255];
+            payload.extend_from_slice(&zeros[..pad_len]);
+        }
+
+        self.enc_key
+            .seal_in_place_append_tag(nonce, aad, &mut payload)
+            .map_err(|_| rustls::Error::EncryptError)?;
+
+        Ok(rustls::crypto::cipher::OutboundOpaqueMessage::new(
+            rustls::ContentType::ApplicationData,
+            rustls::ProtocolVersion::TLSv1_2,
+            payload,
+        ))
+    }
+
+    fn encrypted_payload_len(&self, payload_len: usize) -> usize {
+        payload_len + 1 + max_tls13_record_pad(payload_len) + self.enc_key.algorithm().tag_len()
+    }
+}
+
+fn wrap_padded_tls13_suite(
+    base: rustls::SupportedCipherSuite,
+    ring_alg: &'static ring::aead::Algorithm,
+) -> rustls::SupportedCipherSuite {
+    let inner = base.tls13().expect("TLS 1.3 cipher suite");
+    let aead_alg: &'static dyn rustls::crypto::cipher::Tls13AeadAlgorithm =
+        Box::leak(Box::new(PaddedTls13AeadAlgorithm {
+            inner: inner.aead_alg,
+            ring_alg,
+        }));
+    let suite: &'static rustls::Tls13CipherSuite = Box::leak(Box::new(rustls::Tls13CipherSuite {
+        common: rustls::CipherSuiteCommon {
+            suite: inner.common.suite,
+            hash_provider: inner.common.hash_provider,
+            confidentiality_limit: inner.common.confidentiality_limit,
+        },
+        hkdf_provider: inner.hkdf_provider,
+        aead_alg,
+        quic: inner.quic,
+    }));
+    rustls::SupportedCipherSuite::Tls13(suite)
+}
+
+static PADDED_TLS13_SUITES: Lazy<[rustls::SupportedCipherSuite; 3]> = Lazy::new(|| {
+    use rustls::crypto::ring::cipher_suite;
+    [
+        wrap_padded_tls13_suite(
+            cipher_suite::TLS13_AES_256_GCM_SHA384,
+            &ring::aead::AES_256_GCM,
+        ),
+        wrap_padded_tls13_suite(
+            cipher_suite::TLS13_AES_128_GCM_SHA256,
+            &ring::aead::AES_128_GCM,
+        ),
+        wrap_padded_tls13_suite(
+            cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+            &ring::aead::CHACHA20_POLY1305,
+        ),
+    ]
+});
+
+fn padded_ring_provider() -> rustls::crypto::CryptoProvider {
+    let mut provider = rustls::crypto::ring::default_provider();
+    let padded = &*PADDED_TLS13_SUITES;
+    provider.cipher_suites = provider
+        .cipher_suites
+        .into_iter()
+        .map(|s| match s.suite() {
+            rustls::CipherSuite::TLS13_AES_256_GCM_SHA384 => padded[0],
+            rustls::CipherSuite::TLS13_AES_128_GCM_SHA256 => padded[1],
+            rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => padded[2],
+            _ => s,
+        })
+        .collect();
+    provider
+}
+
 pub fn build_tls_config_for_fingerprint(fp: &str) -> Arc<ClientConfig> {
     let mut root_store = RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-    let mut provider = rustls::crypto::ring::default_provider();
+    let mut provider = padded_ring_provider();
     provider.cipher_suites = order_cipher_suites_for_profile(&provider.cipher_suites, fp);
 
     let mut cfg = ClientConfig::builder_with_provider(Arc::new(provider))
@@ -171,9 +337,7 @@ pub static TLS_CONFIG_SAFARI: Lazy<Arc<ClientConfig>> =
 static TLS_CONFIG_RELAY: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let mut config = ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
+    let mut config = ClientConfig::builder_with_provider(Arc::new(padded_ring_provider()))
     .with_safe_default_protocol_versions()
     .expect("Safe TLS protocol versions")
     .with_root_certificates(roots)
@@ -252,8 +416,6 @@ pub fn get_tls_config_for_fingerprint(fp: &str) -> Arc<ClientConfig> {
     }
 }
 
-pub static TLS_CONFIG: Lazy<Arc<ClientConfig>> = Lazy::new(|| TLS_CONFIG_CHROME.clone());
-
 pub static TLS_ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub fn is_tls_enabled() -> bool {
@@ -310,12 +472,6 @@ pub struct WsHandshakeError {
     pub status_line: String,
     pub headers: HashMap<String, String>,
     pub location: String,
-}
-
-impl WsHandshakeError {
-    pub fn is_redirect(&self) -> bool {
-        matches!(self.status_code, 301 | 302 | 303 | 307 | 308)
-    }
 }
 
 #[derive(Debug)]
@@ -470,8 +626,24 @@ pub fn find_sni_split_pos(buf: &[u8]) -> Option<usize> {
 }
 
 #[derive(Debug)]
+struct PendingRecordWrite {
+    data: Vec<u8>,
+    offset: usize,
+    tcp_split_at: Option<usize>,
+    flushed_split: bool,
+    orig_consumed: usize,
+}
+
+#[derive(Debug)]
 enum SplitStreamState {
     Init,
+    /// Draining rewritten two-record ClientHello (optionally split across TCP segments).
+    RecordPending(PendingRecordWrite),
+    /// Delaying between the first and second TLS record when TCP split delay is non-zero.
+    RecordDelaying {
+        pending: PendingRecordWrite,
+        sleep: Pin<Box<tokio::time::Sleep>>,
+    },
     /// Flushing a segment before sending the next one.
     Flushing,
     /// Delaying after sending a segment before sending the next one.
@@ -485,6 +657,7 @@ enum SplitStreamState {
 pub struct TlsClientHelloSplitStream<S> {
     inner: S,
     enabled: bool,
+    record_fragment: bool,
     splits: Vec<usize>,
     global_written: usize,
     delay: Duration,
@@ -493,10 +666,19 @@ pub struct TlsClientHelloSplitStream<S> {
 
 impl<S> TlsClientHelloSplitStream<S> {
     pub fn new(inner: S, split_pos: usize, delay: Duration) -> Self {
-        let enabled = split_pos > 0;
+        Self::new_with_options(inner, split_pos > 0, delay, false)
+    }
+
+    pub fn new_with_options(
+        inner: S,
+        tcp_split: bool,
+        delay: Duration,
+        record_fragment: bool,
+    ) -> Self {
         Self {
             inner,
-            enabled,
+            enabled: tcp_split,
+            record_fragment,
             splits: Vec::new(),
             global_written: 0,
             delay,
@@ -533,6 +715,64 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for TlsClientHelloSplitStream<S> {
             let this = self.as_mut().get_mut();
             match &mut this.state {
                 SplitStreamState::Init => {
+                    if this.record_fragment
+                        && buf.len() >= 9
+                        && buf[0] == 0x16
+                        && buf[1] == 0x03
+                        && (1..=4).contains(&buf[2])
+                        && buf[5] == 0x01
+                    {
+                        let rec_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+                        if rec_len >= 2 && rec_len <= 16384 && 5 + rec_len <= buf.len() {
+                            let split_payload_pos = match find_sni_split_pos(&buf[..5 + rec_len]) {
+                                Some(sni_wire) if sni_wire > 5 && sni_wire < 5 + rec_len => {
+                                    sni_wire - 5
+                                }
+                                _ => (rec_len / 2).clamp(1, rec_len - 1),
+                            };
+                            let p1_len = split_payload_pos;
+                            let p2_len = rec_len - split_payload_pos;
+                            let mut rewritten = Vec::with_capacity(10 + rec_len);
+                            rewritten.extend_from_slice(&[
+                                0x16,
+                                buf[1],
+                                buf[2],
+                                (p1_len >> 8) as u8,
+                                p1_len as u8,
+                            ]);
+                            rewritten.extend_from_slice(&buf[5..5 + split_payload_pos]);
+                            rewritten.extend_from_slice(&[
+                                0x16,
+                                buf[1],
+                                buf[2],
+                                (p2_len >> 8) as u8,
+                                p2_len as u8,
+                            ]);
+                            rewritten.extend_from_slice(&buf[5 + split_payload_pos..5 + rec_len]);
+
+                            let tcp_split_at = if this.enabled {
+                                Some(5 + split_payload_pos)
+                            } else {
+                                None
+                            };
+                            crate::ldebug!(
+                                "TLS ClientHello 0x16 record fragmentation applied: orig_rec_len={}, p1_len={}, p2_len={}, tcp_split={}",
+                                rec_len,
+                                p1_len,
+                                p2_len,
+                                this.enabled
+                            );
+                            this.state = SplitStreamState::RecordPending(PendingRecordWrite {
+                                data: rewritten,
+                                offset: 0,
+                                tcp_split_at,
+                                flushed_split: false,
+                                orig_consumed: 5 + rec_len,
+                            });
+                            continue;
+                        }
+                    }
+
                     if !this.enabled || buf.len() < 9 || buf.first() != Some(&0x16) {
                         this.state = SplitStreamState::Done;
                         return Pin::new(&mut this.inner).poll_write(cx, buf);
@@ -561,6 +801,74 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for TlsClientHelloSplitStream<S> {
 
                         this.splits = splits;
                         this.global_written = 0;
+                    }
+                }
+                SplitStreamState::RecordPending(pending) => {
+                    if let Some(split_at) = pending.tcp_split_at {
+                        if !pending.flushed_split {
+                            if pending.offset < split_at {
+                                let chunk = &pending.data[pending.offset..split_at];
+                                match Pin::new(&mut this.inner).poll_write(cx, chunk) {
+                                    Poll::Ready(Ok(0)) => return Poll::Ready(Ok(0)),
+                                    Poll::Ready(Ok(n)) => {
+                                        pending.offset += n;
+                                        continue;
+                                    }
+                                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                                    Poll::Pending => return Poll::Pending,
+                                }
+                            } else {
+                                match Pin::new(&mut this.inner).poll_flush(cx) {
+                                    Poll::Ready(Ok(())) => {
+                                        pending.flushed_split = true;
+                                        if this.delay > Duration::ZERO {
+                                            let prev = std::mem::replace(
+                                                &mut this.state,
+                                                SplitStreamState::Done,
+                                            );
+                                            if let SplitStreamState::RecordPending(pending) = prev {
+                                                this.state = SplitStreamState::RecordDelaying {
+                                                    pending,
+                                                    sleep: Box::pin(tokio::time::sleep(this.delay)),
+                                                };
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                                    Poll::Pending => return Poll::Pending,
+                                }
+                            }
+                        }
+                    }
+
+                    if pending.offset < pending.data.len() {
+                        let chunk = &pending.data[pending.offset..];
+                        match Pin::new(&mut this.inner).poll_write(cx, chunk) {
+                            Poll::Ready(Ok(0)) => return Poll::Ready(Ok(0)),
+                            Poll::Ready(Ok(n)) => {
+                                pending.offset += n;
+                                continue;
+                            }
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    } else {
+                        let consumed = pending.orig_consumed;
+                        this.state = SplitStreamState::Done;
+                        return Poll::Ready(Ok(consumed));
+                    }
+                }
+                SplitStreamState::RecordDelaying { sleep, .. } => {
+                    match sleep.as_mut().poll(cx) {
+                        Poll::Ready(()) => {
+                            let prev = std::mem::replace(&mut this.state, SplitStreamState::Done);
+                            if let SplitStreamState::RecordDelaying { pending, .. } = prev {
+                                this.state = SplitStreamState::RecordPending(pending);
+                            }
+                            continue;
+                        }
+                        Poll::Pending => return Poll::Pending,
                     }
                 }
                 SplitStreamState::Flushing => {
@@ -725,7 +1033,7 @@ impl HeartbeatPolicy {
     pub fn effective() -> Self {
         let profile = crate::network_profile::get_profile();
         if profile.websocket_keep_alive_seconds > 0 {
-            let idle = Duration::from_secs(profile.websocket_keep_alive_seconds.clamp(15, 60));
+            let idle = Duration::from_secs(profile.websocket_keep_alive_seconds.clamp(15, 120));
             return Self {
                 idle_before_ping: idle,
                 pong_deadline: Duration::from_secs((idle.as_secs() / 2).clamp(10, 25)),
@@ -917,25 +1225,6 @@ impl RawWebSocket {
 
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Relaxed)
-    }
-
-    pub fn is_early_data_sent(&self) -> bool {
-        self.early_data_sent
-    }
-
-    pub async fn inject_initial_payload(&self, data: Vec<u8>) {
-        if !data.is_empty() {
-            *self.buffered_payload.lock().await = Some(data);
-            self.record_frame_activity();
-        }
-    }
-
-    pub async fn send_text(&self, text: &str) -> Result<(), WsError> {
-        if self.is_closed() {
-            return Err(WsError::Other("WebSocket closed".to_string()));
-        }
-        self.record_send_activity();
-        self.write_frame(&build_frame(OP_TEXT, text.as_bytes(), true), WS_WRITE_TIMEOUT).await
     }
 
     pub async fn send(&self, data: &[u8]) -> Result<(), WsError> {
@@ -1359,7 +1648,7 @@ pub fn build_frame_ext(opcode: u8, data: &[u8], mask: bool, fin: bool) -> Vec<u8
     if mask {
         header_size += 4;
     }
-    if length >= 126 && length < 65536 {
+    if (126..65536).contains(&length) {
         header_size += 2;
     } else if length >= 65536 {
         header_size += 8;
@@ -1443,23 +1732,23 @@ fn apply_tcp_keepalive(socket: &socket2::Socket) {
     let _ = socket.set_tcp_keepalive(&ka);
 }
 
-fn apply_socket_buffer_bounds(socket: &socket2::Socket) {
+fn apply_socket_buffer_bounds(sock: &socket2::Socket) {
     let ceiling = crate::config::max_socket_buffer();
     let target_recv = RECV_BUF.load(Ordering::Relaxed);
     let target_send = SEND_BUF.load(Ordering::Relaxed);
 
     if target_recv > 0 {
         let recv_size = target_recv.clamp(MIN_SOCKET_BUFFER, ceiling) as usize;
-        let _ = socket.set_recv_buffer_size(recv_size);
+        let _ = sock.set_recv_buffer_size(recv_size);
     }
     if target_send > 0 {
         let send_size = target_send.clamp(MIN_SOCKET_BUFFER, ceiling) as usize;
-        let _ = socket.set_send_buffer_size(send_size);
+        let _ = sock.set_send_buffer_size(send_size);
     }
 }
 
 pub fn set_client_sock_opts(stream: &TcpStream) {
-    let _ = stream.set_nodelay(true);
+    let _ = stream.set_nodelay(TCP_NODELAY.load(Ordering::Relaxed));
     let sock = socket2::SockRef::from(stream);
     crate::platform::configure_socket_platform(&sock);
     apply_tcp_keepalive(&sock);
@@ -1470,7 +1759,7 @@ pub fn set_client_sock_opts(stream: &TcpStream) {
 }
 
 pub fn set_sock_opts(stream: &TcpStream) {
-    let _ = stream.set_nodelay(true);
+    let _ = stream.set_nodelay(TCP_NODELAY.load(Ordering::Relaxed));
     let sock = socket2::SockRef::from(stream);
     crate::platform::configure_socket_platform(&sock);
 
@@ -1513,11 +1802,17 @@ pub async fn connect_outbound_tcp(
 
     crate::platform::configure_socket_platform(&socket);
     let _ = socket.set_nonblocking(true);
-    let _ = socket.set_nodelay(true);
+    let _ = socket.set_nodelay(TCP_NODELAY.load(Ordering::Relaxed));
 
     apply_tcp_keepalive(&socket);
     crate::platform::apply_mobile_mss_clamp(&socket);
     apply_socket_buffer_bounds(&socket);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let _ = crate::protect_socket_fd(socket.as_raw_fd());
+    }
 
     let target_sockaddr = socket2::SockAddr::from(*addr);
     match socket.connect(&target_sockaddr) {
@@ -1564,9 +1859,7 @@ pub fn ws_connect_timeout(timeout: f64) -> Duration {
 }
 
 pub fn ws_handshake_timeout(total: Duration) -> Duration {
-    if total <= Duration::ZERO {
-        Duration::from_secs(10)
-    } else if total > Duration::from_secs(10) {
+    if total <= Duration::ZERO || total > Duration::from_secs(10) {
         Duration::from_secs(10)
     } else {
         total
@@ -1606,9 +1899,6 @@ pub fn server_name(domain: &str) -> ServerName<'static> {
         .unwrap_or_else(|_| ServerName::IpAddress("127.0.0.1".parse::<IpAddr>().unwrap().into()))
 }
 
-pub const HAPPY_EYEBALLS_DEFAULT_DELAY: Duration = Duration::from_millis(200);
-pub const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(200);
-
 /// Connection Attempt Delay for Happy Eyeballs (RFC 8305 Section 5).
 /// Uses the committed FSM profile, so RTT samples cannot bypass its dwell/cooldown.
 pub fn compute_happy_eyeballs_delay() -> Duration {
@@ -1635,219 +1925,6 @@ fn committed_happy_eyeballs_delay(committed_ms: u64, is_mobile: bool) -> Duratio
         ((committed_ms.clamp(50, 2000) + 25) / 50) * 50
     };
     Duration::from_millis(delay)
-}
-
-pub async fn happy_eyeballs_tcp_connect(
-    addrs: &[SocketAddr],
-    total_timeout: Duration,
-) -> Result<(TcpStream, SocketAddr), WsError> {
-    if addrs.is_empty() {
-        return Err(WsError::Other(
-            "no candidate addresses provided".to_string(),
-        ));
-    }
-    if addrs.len() == 1 {
-        let addr = addrs[0];
-        let stream = connect_outbound_tcp(&addr, total_timeout).await?;
-        return Ok((stream, addr));
-    }
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<(TcpStream, SocketAddr)>(1);
-    let cancel_token = CancellationToken::new();
-    let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(addrs.len());
-
-    let mut next_idx = 0;
-    let num_addrs = addrs.len();
-
-    let deadline = tokio::time::sleep(total_timeout);
-    tokio::pin!(deadline);
-
-    let mut stagger_timer = tokio::time::interval(compute_happy_eyeballs_delay());
-    let mut remaining_active: usize = 0;
-
-    let (err_tx, mut err_rx) = tokio::sync::mpsc::channel::<std::io::Error>(num_addrs);
-    #[allow(unused_assignments)]
-    let mut last_err = None;
-
-    loop {
-        tokio::select! {
-            _ = &mut deadline => {
-                cancel_token.cancel();
-                for t in tasks {
-                    t.abort();
-                }
-                return Err(WsError::Timeout);
-            }
-            res = rx.recv() => {
-                if let Some((stream, winning_addr)) = res {
-                    cancel_token.cancel();
-                    for t in tasks {
-                        t.abort();
-                    }
-                    return Ok((stream, winning_addr));
-                }
-            }
-            err = err_rx.recv() => {
-                if let Some(e) = err {
-                    last_err = Some(e);
-                    remaining_active = remaining_active.saturating_sub(1);
-                    // Fast failover: immediately launch next candidate on early connection failure
-                    if next_idx < num_addrs {
-                        let target_addr = addrs[next_idx];
-                        next_idx += 1;
-                        remaining_active += 1;
-
-                        let tx = tx.clone();
-                        let err_tx = err_tx.clone();
-                        let cancel = cancel_token.clone();
-
-                        tasks.push(tokio::spawn(async move {
-                            tokio::select! {
-                                _ = cancel.cancelled() => {}
-                                res = connect_outbound_tcp(&target_addr, total_timeout) => {
-                                    match res {
-                                        Ok(s) => {
-                                            let _ = tx.send((s, target_addr)).await;
-                                        }
-                                        Err(e) => {
-                                            let io_err = match e {
-                                                WsError::Io(err) => err,
-                                                WsError::Timeout => std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"),
-                                                other => std::io::Error::new(std::io::ErrorKind::Other, other.compact()),
-                                            };
-                                            let _ = err_tx.send(io_err).await;
-                                        }
-                                    }
-                                }
-                            }
-                        }));
-                    } else if remaining_active == 0 {
-                        break;
-                    }
-                }
-            }
-            _ = stagger_timer.tick(), if next_idx < num_addrs => {
-                let target_addr = addrs[next_idx];
-                next_idx += 1;
-                remaining_active += 1;
-
-                let tx = tx.clone();
-                let err_tx = err_tx.clone();
-                let cancel = cancel_token.clone();
-
-                tasks.push(tokio::spawn(async move {
-                    tokio::select! {
-                        _ = cancel.cancelled() => {}
-                        res = connect_outbound_tcp(&target_addr, total_timeout) => {
-                            match res {
-                                Ok(s) => {
-                                    let _ = tx.send((s, target_addr)).await;
-                                }
-                                Err(e) => {
-                                    let io_err = match e {
-                                        WsError::Io(err) => err,
-                                        WsError::Timeout => std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"),
-                                        other => std::io::Error::new(std::io::ErrorKind::Other, other.compact()),
-                                    };
-                                    let _ = err_tx.send(io_err).await;
-                                }
-                            }
-                        }
-                    }
-                }));
-            }
-        }
-    }
-
-    cancel_token.cancel();
-    for t in tasks {
-        t.abort();
-    }
-
-    if let Some(e) = last_err {
-        Err(WsError::Io(e))
-    } else {
-        Err(WsError::Other(
-            "all connection candidates failed".to_string(),
-        ))
-    }
-}
-
-pub async fn ws_handshake_split_host_fp(
-    raw_conn: TcpStream,
-    dial_ip: &str,
-    tls_sni: &str,
-    host_header: &str,
-    path: &str,
-    fingerprint: &str,
-    timeout: Duration,
-) -> Result<RawWebSocket, WsError> {
-    ws_handshake_split_host_ext(
-        raw_conn,
-        dial_ip,
-        tls_sni,
-        host_header,
-        path,
-        fingerprint,
-        None,
-        timeout,
-    )
-    .await
-}
-
-pub async fn ws_handshake_split_host(
-    raw_conn: TcpStream,
-    dial_ip: &str,
-    tls_sni: &str,
-    host_header: &str,
-    path: &str,
-    timeout: Duration,
-) -> Result<RawWebSocket, WsError> {
-    ws_handshake_split_host_ext(
-        raw_conn,
-        dial_ip,
-        tls_sni,
-        host_header,
-        path,
-        "chrome",
-        None,
-        timeout,
-    )
-    .await
-}
-
-pub async fn ws_handshake_over_stream(
-    raw_conn: TcpStream,
-    dial_ip: &str,
-    domain: &str,
-    path: &str,
-    timeout: Duration,
-) -> Result<RawWebSocket, WsError> {
-    ws_handshake_split_host_ext(
-        raw_conn, dial_ip, domain, domain, path, "chrome", None, timeout,
-    )
-    .await
-}
-
-pub async fn ws_handshake_over_stream_fp(
-    raw_conn: TcpStream,
-    dial_ip: &str,
-    domain: &str,
-    path: &str,
-    fingerprint: &str,
-    timeout: Duration,
-) -> Result<RawWebSocket, WsError> {
-    ws_handshake_split_host_ext(
-        raw_conn,
-        dial_ip,
-        domain,
-        domain,
-        path,
-        fingerprint,
-        None,
-        timeout,
-    )
-    .await
 }
 
 pub async fn ws_upgrade_stream(
@@ -2024,86 +2101,6 @@ pub async fn ws_upgrade_stream(
     }))
 }
 
-pub async fn ws_handshake_split_host_ext(
-    raw_conn: TcpStream,
-    dial_ip: &str,
-    tls_sni: &str,
-    host_header: &str,
-    path: &str,
-    fingerprint: &str,
-    early_data: Option<&[u8]>,
-    timeout: Duration,
-) -> Result<RawWebSocket, WsError> {
-    if !is_tls_enabled() {
-        return ws_handshake_plain_ext(raw_conn, host_header, path, early_data, timeout).await;
-    }
-
-    set_sock_opts(&raw_conn);
-
-    let tls_config = tls_config_for_ws_path(path, fingerprint);
-    let connector = TlsConnector::from(tls_config);
-    let sni = server_name(tls_sni);
-
-    let handshake_timeout = ws_handshake_timeout(timeout);
-    let net_gen = crate::network_profile::current_generation();
-    let should_split = is_tls_client_hello_split_enabled()
-        && (tls_sni.contains("workers.dev") || tls_sni.contains("pages.dev"));
-    let split_stream = TlsClientHelloSplitStream::new(
-        raw_conn,
-        if should_split { 1 } else { 0 },
-        Duration::ZERO,
-    );
-    let tls_start = std::time::Instant::now();
-
-    let tls_conn =
-        match tokio::time::timeout(handshake_timeout, connector.connect(sni, split_stream)).await {
-            Ok(Ok(c)) => {
-                let duration_ms = tls_start.elapsed().as_millis() as u64;
-                let kind = c.get_ref().1.handshake_kind();
-                crate::tls_observability::TLS_TRACKER.write().record_success(
-                    host_header,
-                    net_gen,
-                    kind,
-                    duration_ms,
-                );
-                c
-            }
-            Ok(Err(e)) => {
-                let duration_ms = tls_start.elapsed().as_millis() as u64;
-                crate::tls_observability::TLS_TRACKER.write().record_failure(
-                    host_header,
-                    net_gen,
-                    duration_ms,
-                    &e.to_string(),
-                );
-                if e.kind() != std::io::ErrorKind::ConnectionReset {
-                    ldebug!(" ws tls fail {} via {}: {}", tls_sni, dial_ip, e);
-                }
-                return Err(WsError::Io(e));
-            }
-            Err(_) => {
-                let duration_ms = tls_start.elapsed().as_millis() as u64;
-                crate::tls_observability::TLS_TRACKER.write().record_failure(
-                    host_header,
-                    net_gen,
-                    duration_ms,
-                    "handshake_timeout",
-                );
-                ldebug!(" ws tls fail {} via {}: timeout", tls_sni, dial_ip);
-                return Err(WsError::Timeout);
-            }
-        };
-
-    ws_upgrade_stream(
-        WsStream::Tls(tls_conn),
-        host_header,
-        path,
-        early_data,
-        timeout,
-    )
-    .await
-}
-
 pub async fn ws_handshake_plain_ext(
     raw_conn: TcpStream,
     host_header: &str,
@@ -2160,7 +2157,7 @@ pub async fn ws_connect_happy_eyeballs_split_with_tls(
 
     let ordered_addrs = crate::recovery::order_socket_addrs_for_host(
         expected.network,
-        &host_header,
+        host_header,
         addrs,
     );
     let addrs = ordered_addrs.as_slice();
@@ -2281,10 +2278,11 @@ pub async fn ws_connect_happy_eyeballs_split_with_tls(
 
                     let should_split = is_tls_client_hello_split_enabled()
                         && (tls_sni.contains("workers.dev") || tls_sni.contains("pages.dev"));
-                    let split_stream = TlsClientHelloSplitStream::new(
+                    let split_stream = TlsClientHelloSplitStream::new_with_options(
                         stream,
-                        if should_split { 1 } else { 0 },
+                        should_split,
                         Duration::ZERO,
+                        is_tls_record_padding_enabled(),
                     );
 
                     let tls_start = Instant::now();
@@ -2575,39 +2573,6 @@ pub async fn ws_connect_happy_eyeballs(
     ws_connect_happy_eyeballs_ext(domain, path, None, addrs, timeout).await
 }
 
-pub async fn ws_connect_once(
-    dial_addr: &str,
-    domain: &str,
-    path: &str,
-    timeout: Duration,
-) -> Result<RawWebSocket, WsError> {
-    if dial_addr.is_empty() {
-        return Err(WsError::Other("empty dial address".to_string()));
-    }
-
-    if let Ok(ip) = dial_addr.parse::<IpAddr>() {
-        let sock_addr = SocketAddr::new(ip, default_ws_port());
-        let (stream, _) = happy_eyeballs_tcp_connect(&[sock_addr], timeout).await?;
-        return ws_handshake_over_stream(stream, dial_addr, domain, path, timeout).await;
-    }
-
-    let target_addr = if dial_addr.contains(':') {
-        dial_addr.to_string()
-    } else {
-        format!("{}:{}", dial_addr, default_ws_port())
-    };
-
-    let addrs: Vec<SocketAddr> = match tokio::net::lookup_host(&target_addr).await {
-        Ok(iter) => iter.collect(),
-        Err(e) => return Err(WsError::Io(e)),
-    };
-    if addrs.is_empty() {
-        return Err(WsError::Other(format!("no address resolved for {}", target_addr)));
-    }
-    let (raw_conn, _) = happy_eyeballs_tcp_connect(&addrs, timeout).await?;
-    ws_handshake_over_stream(raw_conn, dial_addr, domain, path, timeout).await
-}
-
 async fn read_line<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<String, WsError> {
     let mut buf = Vec::with_capacity(128);
     let mut byte = [0u8; 1];
@@ -2628,49 +2593,6 @@ async fn read_line<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<String, Ws
         }
     }
     Ok(String::from_utf8_lossy(&buf).to_string())
-}
-
-pub async fn ws_connect(
-    ip: &str,
-    domain: &str,
-    path: &str,
-    timeout: f64,
-) -> Result<RawWebSocket, WsError> {
-    let path = if path.is_empty() { "/apiws" } else { path };
-    let attempt_timeout = ws_connect_timeout(timeout);
-
-    let candidate_ips = if !ip.trim().is_empty() {
-        if let Ok(parsed) = ip.trim().parse::<IpAddr>() {
-            vec![parsed]
-        } else {
-            crate::cfproxy::resolve_dual_stack_ips(ip.trim()).await
-        }
-    } else {
-        crate::cfproxy::resolve_dual_stack_ips(domain).await
-    };
-
-    let port = default_ws_port();
-    let candidate_addrs: Vec<SocketAddr> = candidate_ips
-        .into_iter()
-        .map(|ip_addr| SocketAddr::new(ip_addr, port))
-        .collect();
-
-    if candidate_addrs.is_empty() {
-        return Err(WsError::Other("no candidate addresses found".to_string()));
-    }
-
-    let (ws, _) =
-        ws_connect_happy_eyeballs(domain, path, &candidate_addrs, attempt_timeout).await?;
-    Ok(ws)
-}
-
-pub async fn connect_one_ws(ip: &str, domains: &[String]) -> Option<RawWebSocket> {
-    for d in domains {
-        if let Ok(ws) = ws_connect(ip, d, "/apiws", crate::config::adaptive_ws_connect_timeout()).await {
-            return Some(ws);
-        }
-    }
-    None
 }
 
 #[cfg(test)]

@@ -133,6 +133,12 @@ pub struct TlsObservabilityTracker {
     hosts: HashMap<(String, u64), TlsHostStats>,
 }
 
+impl Default for TlsObservabilityTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TlsObservabilityTracker {
     pub fn new() -> Self {
         Self {

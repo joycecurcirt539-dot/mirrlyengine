@@ -295,15 +295,6 @@ impl From<std::net::IpAddr> for AddressFamily {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct RouteScoreKey {
-    pub network_generation: u64,
-    pub hostname: String,
-    pub ip: std::net::IpAddr,
-    pub family: AddressFamily,
-    pub stage: EstablishmentStage,
-}
-
 #[derive(Debug, Default)]
 struct PathFamilyMetrics {
     ipv4_failures: u32,
@@ -500,10 +491,6 @@ pub fn order_socket_addrs_for_host(
         ordered.extend(v6_addrs);
         ordered
     }
-}
-
-pub fn order_socket_addrs(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
-    order_socket_addrs_for_host(crate::generation_guard::snapshot().network, "", addrs)
 }
 
 pub fn effective_tls_fingerprint() -> &'static str {

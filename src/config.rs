@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 // Constants & Configuration
 // ---------------------------------------------------------------------------
 
-// Nagle's algorithm is enabled by default (TCP_NODELAY = false) for packet coalescing and cellular network stability
+// Controls TCP_NODELAY on proxy and WebSocket sockets (default false = Nagle enabled; toggled via SetTcpNoDelay).
 pub static TCP_NODELAY: AtomicBool = AtomicBool::new(false);
 pub static SOCKS5_OPTIMISTIC_RESPONSE: AtomicBool = AtomicBool::new(true);
 
@@ -68,7 +68,6 @@ pub const BACKGROUND_BUDGET_WIFI_RANGE: AdaptiveRange<usize> = AdaptiveRange::ne
 
 pub const DIAL_TIMEOUT_WIFI_RANGE_MS: AdaptiveRange<u64> = AdaptiveRange::new(1500, 5000);
 pub const DIAL_TIMEOUT_MOBILE_RANGE_MS: AdaptiveRange<u64> = AdaptiveRange::new(2500, 9000);
-pub const RACE_TIMEOUT_RANGE_MS: AdaptiveRange<u64> = AdaptiveRange::new(1200, 5000);
 pub const HAPPY_EYEBALLS_RANGE_MS: AdaptiveRange<u64> = AdaptiveRange::new(80, 800);
 
 /// Adaptive establishment and background concurrency budgets.
@@ -138,21 +137,6 @@ pub fn adaptive_dial_timeout(is_mobile: bool) -> Duration {
     }
 }
 
-/// Adaptive worker race probe timeout.
-pub fn adaptive_race_timeout() -> Duration {
-    let profile = crate::network_profile::get_profile();
-    let rtt = profile.transport_sli.smoothed_rtt_ms;
-    let jitter = profile.transport_sli.jitter_ms;
-    let base_ms = if rtt > 0 {
-        (rtt as u64) * 2 + jitter * 2 + 800
-    } else if profile.is_constrained() {
-        2500
-    } else {
-        2000
-    };
-    Duration::from_millis(RACE_TIMEOUT_RANGE_MS.clamp(base_ms))
-}
-
 /// Adaptive parallel TCP/TLS candidate socket throttle limit.
 pub fn adaptive_parallel_socket_limit() -> usize {
     let profile = crate::network_profile::get_profile();
@@ -193,7 +177,6 @@ pub fn adaptive_ws_connect_timeout() -> f64 {
 }
 
 
-pub const BRIDGE_READ_TIMEOUT: Duration = Duration::from_secs(1800);
 pub const BRIDGE_WRITE_TIMEOUT: Duration = Duration::from_secs(45);
 pub const WS_HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 pub const WS_POOL_HOUSEKEEP_INTERVAL: Duration = Duration::from_secs(10);
@@ -201,13 +184,11 @@ pub const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 // Control writes tolerate the same network stalls as payload writes.
 pub const WS_CONTROL_TIMEOUT: Duration = Duration::from_secs(45);
 pub const WS_BRIDGE_CHUNK_SIZE: usize = 64 * 1024;
-pub const POOLED_FRAME_CAP: usize = WS_BRIDGE_CHUNK_SIZE + 32;
 
 pub const WS_POOL_REUSE_MAX_AGE: f64 = 120.0;
 
 pub const CFPROXY_CACHE_FILE_NAME: &str = "cfproxy-domains-cache.txt";
 pub const CFPROXY_REFRESH_INTERVAL: Duration = Duration::from_secs(12 * 3600);
-pub const CFPROXY_FALLBACK_PARALLEL: usize = 4;
 pub const CFPROXY_429_COOLDOWN: Duration = Duration::from_secs(45);
 pub const CFPROXY_429_MAX_COOLDOWN: Duration = Duration::from_secs(300);
 
@@ -344,19 +325,10 @@ pub fn get_transport_pool_status(running_transport: &str) -> TransportPoolStatus
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Cfproxy429State {
     pub until: Option<Instant>,
     pub strikes: i32,
-}
-
-impl Default for Cfproxy429State {
-    fn default() -> Self {
-        Cfproxy429State {
-            until: None,
-            strikes: 0,
-        }
-    }
 }
 
 // Cloudflare proxy config
@@ -387,6 +359,85 @@ pub const CFPROXY_DOMAINS_URL: &str =
 // MTProto proxy secret
 pub static PROXY_SECRET: Lazy<RwLock<String>> =
     Lazy::new(|| RwLock::new("00000000000000000000000000000000".to_string()));
+
+pub const DEFAULT_FAKETLS_DOMAIN: &str = "www.google.com";
+
+pub static FAKETLS_DOMAIN: Lazy<RwLock<String>> =
+    Lazy::new(|| RwLock::new(DEFAULT_FAKETLS_DOMAIN.to_string()));
+
+pub fn get_faketls_domain() -> String {
+    let dom = FAKETLS_DOMAIN.read().trim().to_string();
+    if dom.is_empty() {
+        DEFAULT_FAKETLS_DOMAIN.to_string()
+    } else {
+        dom
+    }
+}
+
+pub fn set_faketls_domain(domain: &str) {
+    let trimmed = domain.trim();
+    let effective = if trimmed.is_empty() || trimmed.contains('\0') {
+        DEFAULT_FAKETLS_DOMAIN
+    } else {
+        trimmed
+    };
+    *FAKETLS_DOMAIN.write() = effective.to_string();
+}
+
+pub fn apply_proxy_secret_input(raw: &str) -> bool {
+    let s = raw.trim();
+    if !s.is_ascii() || s.len() < 32 {
+        return false;
+    }
+    if s.len() >= 34 && s[..2].eq_ignore_ascii_case("ee") {
+        let sec_hex = &s[2..34];
+        if hex::decode(sec_hex).is_err() {
+            return false;
+        }
+        let domain_hex = &s[34..];
+        let parsed_domain = if domain_hex.is_empty() {
+            None
+        } else {
+            hex::decode(domain_hex)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .map(|d| d.trim().to_string())
+                .filter(|d| !d.is_empty() && !d.contains('\0'))
+        };
+        *PROXY_SECRET.write() = sec_hex.to_ascii_lowercase();
+        set_faketls_domain(parsed_domain.as_deref().unwrap_or(DEFAULT_FAKETLS_DOMAIN));
+        return true;
+    }
+    if s.len() == 34 && s[..2].eq_ignore_ascii_case("dd") {
+        let sec_hex = &s[2..34];
+        if hex::decode(sec_hex).is_err() {
+            return false;
+        }
+        *PROXY_SECRET.write() = sec_hex.to_ascii_lowercase();
+        set_faketls_domain(DEFAULT_FAKETLS_DOMAIN);
+        return true;
+    }
+    if s.len() == 32 {
+        if hex::decode(s).is_err() {
+            return false;
+        }
+        *PROXY_SECRET.write() = s.to_ascii_lowercase();
+        set_faketls_domain(DEFAULT_FAKETLS_DOMAIN);
+        return true;
+    }
+    false
+}
+
+pub fn format_secret_with_prefix(tls_enabled: bool) -> String {
+    let sec = PROXY_SECRET.read().clone();
+    if tls_enabled {
+        let domain = get_faketls_domain();
+        let domain_hex = hex::encode(domain.as_bytes());
+        format!("ee{}{}", sec, domain_hex)
+    } else {
+        format!("dd{}", sec)
+    }
+}
 
 pub static LAST_SOCKS5_WORKER: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::new()));
 
@@ -452,18 +503,6 @@ pub static CFPROXY_ENC: &[&str] = &[
     "efabnxaowuzs.com",
     "zaftuzsftqdq.com",
 ];
-
-// DC default IPs
-pub static DC_DEFAULT_IPS: Lazy<HashMap<i32, &'static str>> = Lazy::new(|| {
-    let mut m = HashMap::new();
-    m.insert(1, "149.154.175.50");
-    m.insert(2, "149.154.167.51");
-    m.insert(3, "149.154.175.100");
-    m.insert(4, "149.154.167.91");
-    m.insert(5, "149.154.171.5");
-    m.insert(203, "91.105.192.100");
-    m
-});
 
 pub fn canonical_dc_ipv4(dc: i32) -> &'static str {
     match dc {
@@ -657,10 +696,6 @@ pub static DC_OVERRIDES: Lazy<HashMap<i32, i32>> = Lazy::new(|| {
 
 // Global state
 pub static DC_OPT: Lazy<RwLock<HashMap<i32, String>>> = Lazy::new(|| RwLock::new(HashMap::new()));
-pub static WS_BLACKLIST: Lazy<RwLock<HashMap<(i32, i32), bool>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
-pub static DC_FAIL_UNTIL: Lazy<RwLock<HashMap<(i32, i32), f64>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
 
 // ---------------------------------------------------------------------------
 // Stats
@@ -671,14 +706,9 @@ pub struct Stats {
     pub connections_total: AtomicI64,
     pub connections_active: AtomicI64,
     pub connections_ws: AtomicI64,
-    pub connections_tcp_fallback: AtomicI64,
     pub connections_cfproxy: AtomicI64,
-    pub socks5_v2_sessions: AtomicI64,
-    pub socks5_v1_downgrades: AtomicI64,
     pub socks5_fastpath_hits: AtomicI64,
-    pub socks5_fallback_triggers: AtomicI64,
     pub connections_http_reject: AtomicI64,
-    pub connections_passthrough: AtomicI64,
     pub connections_bad: AtomicI64,
     pub ws_errors: AtomicI64,
     pub bytes_up: AtomicI64,
@@ -705,15 +735,12 @@ impl Stats {
         let ph = self.pool_hits.load(Ordering::Relaxed);
         let pm = self.pool_misses.load(Ordering::Relaxed);
         format!(
-            "total={} active={} ws={} cf={} v2={} v1_down={} fp={} fb={} bad={} err={} pool={}/{} up={} down={}",
+            "total={} active={} ws={} cf={} fp={} bad={} err={} pool={}/{} up={} down={}",
             self.connections_total.load(Ordering::Relaxed),
             self.connections_active.load(Ordering::Relaxed),
             self.connections_ws.load(Ordering::Relaxed),
             self.connections_cfproxy.load(Ordering::Relaxed),
-            self.socks5_v2_sessions.load(Ordering::Relaxed),
-            self.socks5_v1_downgrades.load(Ordering::Relaxed),
             self.socks5_fastpath_hits.load(Ordering::Relaxed),
-            self.socks5_fallback_triggers.load(Ordering::Relaxed),
             self.connections_bad.load(Ordering::Relaxed),
             self.ws_errors.load(Ordering::Relaxed),
             ph,
@@ -736,22 +763,9 @@ impl Stats {
         if cf > 0 {
             parts.push(format!("cf:{}", cf));
         }
-
-        let v2 = self.socks5_v2_sessions.load(Ordering::Relaxed);
-        if v2 > 0 {
-            parts.push(format!("v2:{}", v2));
-        }
-        let v1_down = self.socks5_v1_downgrades.load(Ordering::Relaxed);
-        if v1_down > 0 {
-            parts.push(format!("v1_down:{}", v1_down));
-        }
         let fp = self.socks5_fastpath_hits.load(Ordering::Relaxed);
         if fp > 0 {
             parts.push(format!("fp:{}", fp));
-        }
-        let fb = self.socks5_fallback_triggers.load(Ordering::Relaxed);
-        if fb > 0 {
-            parts.push(format!("fb:{}", fb));
         }
         let err = self.ws_errors.load(Ordering::Relaxed);
         if err > 0 {
@@ -777,14 +791,9 @@ impl Stats {
         self.connections_total.store(0, Ordering::Relaxed);
         self.connections_active.store(0, Ordering::Relaxed);
         self.connections_ws.store(0, Ordering::Relaxed);
-        self.connections_tcp_fallback.store(0, Ordering::Relaxed);
         self.connections_cfproxy.store(0, Ordering::Relaxed);
-        self.socks5_v2_sessions.store(0, Ordering::Relaxed);
-        self.socks5_v1_downgrades.store(0, Ordering::Relaxed);
         self.socks5_fastpath_hits.store(0, Ordering::Relaxed);
-        self.socks5_fallback_triggers.store(0, Ordering::Relaxed);
         self.connections_http_reject.store(0, Ordering::Relaxed);
-        self.connections_passthrough.store(0, Ordering::Relaxed);
         self.connections_bad.store(0, Ordering::Relaxed);
         self.ws_errors.store(0, Ordering::Relaxed);
         self.bytes_up.store(0, Ordering::Relaxed);
@@ -873,6 +882,96 @@ impl MobileNetworkTestGuard {
 impl Drop for MobileNetworkTestGuard {
     fn drop(&mut self) {
         MOBILE_NETWORK.store(self.prev, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::*;
+
+    struct SecretTestGuard {
+        _lock: parking_lot::MutexGuard<'static, ()>,
+        prev_secret: String,
+        prev_domain: String,
+    }
+
+    impl SecretTestGuard {
+        fn acquire() -> Self {
+            static LOCK: Lazy<parking_lot::Mutex<()>> = Lazy::new(|| parking_lot::Mutex::new(()));
+            let lock = LOCK.lock();
+            let prev_secret = PROXY_SECRET.read().clone();
+            let prev_domain = FAKETLS_DOMAIN.read().clone();
+            Self {
+                _lock: lock,
+                prev_secret,
+                prev_domain,
+            }
+        }
+    }
+
+    impl Drop for SecretTestGuard {
+        fn drop(&mut self) {
+            *PROXY_SECRET.write() = self.prev_secret.clone();
+            *FAKETLS_DOMAIN.write() = self.prev_domain.clone();
+        }
+    }
+
+    #[test]
+    fn secret_parsing_and_faketls_domain_contract() {
+        let _guard = SecretTestGuard::acquire();
+
+        // 1. ee<32_hex><domain_hex> stores normalized 32-hex secret + decoded domain.
+        let cf_hex = hex::encode("cloudflare.com".as_bytes());
+        assert!(apply_proxy_secret_input(&format!(
+            "EE0123456789ABCDEF0123456789ABCDEF{}",
+            cf_hex
+        )));
+        assert_eq!(*PROXY_SECRET.read(), "0123456789abcdef0123456789abcdef");
+        assert_eq!(get_faketls_domain(), "cloudflare.com");
+        assert_eq!(
+            format_secret_with_prefix(true),
+            format!("ee0123456789abcdef0123456789abcdef{}", cf_hex)
+        );
+        assert_eq!(
+            format_secret_with_prefix(false),
+            "dd0123456789abcdef0123456789abcdef"
+        );
+
+        // 2. ee<32_hex> without domain falls back to DEFAULT_FAKETLS_DOMAIN.
+        assert!(apply_proxy_secret_input("eeaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert_eq!(*PROXY_SECRET.read(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(get_faketls_domain(), DEFAULT_FAKETLS_DOMAIN);
+
+        // 3. ee<32_hex><invalid_hex> falls back to DEFAULT_FAKETLS_DOMAIN.
+        assert!(apply_proxy_secret_input("eebbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbzzzz"));
+        assert_eq!(*PROXY_SECRET.read(), "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert_eq!(get_faketls_domain(), DEFAULT_FAKETLS_DOMAIN);
+
+        // 4. dd<32_hex> and bare <32_hex> reset domain to DEFAULT_FAKETLS_DOMAIN.
+        assert!(apply_proxy_secret_input(&format!(
+            "eecccccccccccccccccccccccccccccccc{}",
+            cf_hex
+        )));
+        assert_eq!(get_faketls_domain(), "cloudflare.com");
+        assert!(apply_proxy_secret_input("DDdddddddddddddddddddddddddddddddd"));
+        assert_eq!(*PROXY_SECRET.read(), "dddddddddddddddddddddddddddddddd");
+        assert_eq!(get_faketls_domain(), DEFAULT_FAKETLS_DOMAIN);
+
+        assert!(apply_proxy_secret_input(&format!(
+            "eecccccccccccccccccccccccccccccccc{}",
+            cf_hex
+        )));
+        assert!(apply_proxy_secret_input("11111111111111111111111111111111"));
+        assert_eq!(*PROXY_SECRET.read(), "11111111111111111111111111111111");
+        assert_eq!(get_faketls_domain(), DEFAULT_FAKETLS_DOMAIN);
+
+        // 5. Invalid inputs leave secret and domain unchanged.
+        assert!(!apply_proxy_secret_input("short"));
+        assert!(!apply_proxy_secret_input("not_hex_0123456789abcdef01234567"));
+        assert!(!apply_proxy_secret_input("dd1234"));
+        assert!(!apply_proxy_secret_input("п1111111111111111111111111111111"));
+        assert_eq!(*PROXY_SECRET.read(), "11111111111111111111111111111111");
+        assert_eq!(get_faketls_domain(), DEFAULT_FAKETLS_DOMAIN);
     }
 }
 

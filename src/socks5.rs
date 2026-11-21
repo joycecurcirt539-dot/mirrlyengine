@@ -349,35 +349,49 @@ async fn handle_socks5_client(
         return;
     }
 
-    // Ensure TCP_NODELAY is active for immediate transmission without Nagle delay
-    let _ = client.set_nodelay(true);
+    // Apply configured TCP_NODELAY option (default false = Nagle enabled)
+    let _ = client.set_nodelay(TCP_NODELAY.load(Ordering::Relaxed));
 
-    // -- Telegram Host: Immediate SOCKS5 0x00 success reply --
-    // Per RFC 1928, the client waits for the proxy's CONNECT reply before sending payload.
-    // An immediate reply yields 0 ms RTT in Telegram's tgnet latency estimator,
-    // which provokes tgnet into opening 4-8 concurrent chunk download streams immediately.
-    if client
-        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .await
-        .is_err()
-    {
-        return;
-    }
+    handle_socks5_telegram_client(
+        client,
+        target_host,
+        target_port,
+        cancel,
+        |dc, is_media, worker_dst, effective_port, init_buf, cancel_tok| {
+            let worker_dst = worker_dst.to_string();
+            let init_vec = init_buf.to_vec();
+            let cancel_tok = cancel_tok.clone();
+            async move {
+                socks5_acquire_upstream_ws(
+                    dc,
+                    is_media,
+                    &worker_dst,
+                    effective_port,
+                    &init_vec,
+                    &cancel_tok,
+                )
+                .await
+            }
+        },
+    )
+    .await;
+}
 
-    // Read initial MTProto data with coalescing:
-    // Guarantees at least 64 bytes for MTProto handshake, and captures any pipelined RPC payload
-    // (such as TL_ping_delay_disconnect) sent in the same burst by Telegram client.
+async fn read_socks5_telegram_init(
+    client: &mut TcpStream,
+    cancel: &CancellationToken,
+) -> Option<Vec<u8>> {
     let mut init_buf = vec![0u8; 4096];
     let mut total_read = 0;
     while total_read < 64 {
         let read_res = tokio::select! {
-            _ = cancel.cancelled() => return,
+            _ = cancel.cancelled() => return None,
             res = tokio::time::timeout(Duration::from_secs(15), client.read(&mut init_buf[total_read..])) => res,
         };
         match read_res {
             Ok(Ok(0)) | Err(_) | Ok(Err(_)) => {
                 ldebug!("SOCKS5 Telegram client disconnected before 64-byte init packet");
-                return;
+                return None;
             }
             Ok(Ok(n)) => {
                 total_read += n;
@@ -407,31 +421,20 @@ async fn handle_socks5_client(
         };
     }
     init_buf.truncate(total_read);
+    Some(init_buf)
+}
 
-    // Reject HTTP transport attempts
-    if crate::proxy::is_http_transport(&init_buf[..64]) {
-        STATS.connections_http_reject.fetch_add(1, Ordering::Relaxed);
-        ldebug!("SOCKS5 rejected HTTP transport on port {}", target_port);
-        let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
-        return;
-    }
-
-    // Extract DC, media flag, and protocol tag from destination host and initial 64-byte handshake
-    let host_dc = lookup_telegram_dc(&target_host);
-    let init_dc = dc_from_init(&init_buf[..64]);
-    let (dc, mut is_media, detected_proto) = match (host_dc, init_dc) {
-        (Some((hdc, hmedia)), Some((_idc, imedia, proto))) => (hdc, hmedia || imedia, Some(proto)),
-        (Some((hdc, hmedia)), None) => (hdc, hmedia, None),
-        (None, Some((idc, imedia, proto))) => (idc, imedia, Some(proto)),
-        (None, None) => (2, false, None),
-    };
-    if dc == 4 {
-        is_media = true;
-    }
-
-    let (worker_dst, effective_port) =
-        resolve_socks5_telegram_destination(&target_host, target_port, Some(dc), is_media);
-
+async fn handle_socks5_telegram_client<F, Fut>(
+    mut client: TcpStream,
+    target_host: String,
+    target_port: u16,
+    cancel: CancellationToken,
+    acquire_ws: F,
+) where
+    F: FnOnce(i32, bool, &str, u16, &[u8], &CancellationToken) -> Fut,
+    Fut: std::future::Future<Output = Option<(RawWebSocket, String)>>,
+{
+    let optimistic = SOCKS5_OPTIMISTIC_RESPONSE.load(Ordering::Relaxed);
     let worker_enabled = CFPROXY_ENABLED.load(Ordering::Relaxed);
     let uplink_mode = crate::config::get_socks5_uplink_mode();
     let uplink_name = if uplink_mode == crate::config::SOCKS5_UPLINK_FLOWSEAL {
@@ -439,70 +442,224 @@ async fn handle_socks5_client(
     } else {
         "Cloudflare Worker"
     };
+    let is_flowseal = uplink_mode == crate::config::SOCKS5_UPLINK_FLOWSEAL
+        || CFPROXY.read().user_domain.is_empty();
 
-    let init_head: Option<[u8; 64]> = if init_buf.len() >= 64 {
-        let mut h = [0u8; 64];
-        h.copy_from_slice(&init_buf[..64]);
-        Some(h)
-    } else {
-        None
-    };
-
-    let initial_payload = if init_buf.len() > 64 {
-        init_buf[64..].to_vec()
-    } else {
-        Vec::new()
-    };
-
-    if worker_enabled {
-        ldebug!(
-            "SOCKS5 routing to {} for DC{}{}: {}:{} (coalesced: {} bytes)",
-            uplink_name,
-            dc,
-            if is_media { " (media)" } else { "" },
-            worker_dst,
-            effective_port,
-            total_read
-        );
-
-        let ws_opt =
-            socks5_acquire_upstream_ws(dc, is_media, &worker_dst, effective_port, &init_buf, &cancel)
-                .await;
-        if let Some((ws, winner_domain)) = ws_opt {
-            STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
-            STATS.connections_ws.fetch_add(1, Ordering::Relaxed);
-            let is_flowseal = uplink_mode == crate::config::SOCKS5_UPLINK_FLOWSEAL || CFPROXY.read().user_domain.is_empty();
-            let pending_payload = if is_flowseal { initial_payload } else { Vec::new() };
-            bridge_socks5_ws(
-                client,
-                Arc::new(ws),
-                dc,
-                is_media,
-                &winner_domain,
-                cancel,
-                detected_proto,
-                pending_payload,
-                init_head,
-                is_flowseal,
-            ).await;
+    if optimistic {
+        // -- Telegram Host: Immediate SOCKS5 0x00 success reply --
+        if client
+            .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await
+            .is_err()
+        {
             return;
         }
-        lwarn!(
-            "SOCKS5 Worker upstream unavailable for DC{}; suppressing direct unproxied TCP fallback to protect connection",
-            dc
-        );
-        return;
-    }
 
-    // Direct unproxied TCP fallback to Telegram DC is intentionally disabled:
-    // In Russia, direct IP ranges (149.154.x.x, 91.108.x.x) are blocked/throttled by TSPU.
-    // Attempting direct TCP fallback results in 10-second connection hangs.
-    lwarn!(
-        "SOCKS5 Worker disabled; direct TCP connection to Telegram DC{} {}:{} suppressed to prevent stalls",
-        dc,
-        worker_dst,
-        effective_port
-    );
+        let Some(init_buf) = read_socks5_telegram_init(&mut client, &cancel).await else {
+            return;
+        };
+
+        // Reject HTTP transport attempts
+        if crate::proxy::is_http_transport(&init_buf[..64]) {
+            STATS.connections_http_reject.fetch_add(1, Ordering::Relaxed);
+            ldebug!("SOCKS5 rejected HTTP transport on port {}", target_port);
+            let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+            return;
+        }
+
+        let host_dc = lookup_telegram_dc(&target_host);
+        let init_dc = dc_from_init(&init_buf[..64]);
+        let (dc, mut is_media, detected_proto) = match (host_dc, init_dc) {
+            (Some((hdc, hmedia)), Some((_idc, imedia, proto))) => {
+                (hdc, hmedia || imedia, Some(proto))
+            }
+            (Some((hdc, hmedia)), None) => (hdc, hmedia, None),
+            (None, Some((idc, imedia, proto))) => (idc, imedia, Some(proto)),
+            (None, None) => (2, false, None),
+        };
+        if dc == 4 {
+            is_media = true;
+        }
+
+        let (worker_dst, effective_port) =
+            resolve_socks5_telegram_destination(&target_host, target_port, Some(dc), is_media);
+
+        let mut init_head = [0u8; 64];
+        init_head.copy_from_slice(&init_buf[..64]);
+        let initial_payload = if init_buf.len() > 64 {
+            init_buf[64..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        if worker_enabled {
+            ldebug!(
+                "SOCKS5 routing to {} for DC{}{}: {}:{} (coalesced: {} bytes)",
+                uplink_name,
+                dc,
+                if is_media { " (media)" } else { "" },
+                worker_dst,
+                effective_port,
+                init_buf.len()
+            );
+
+            let ws_opt =
+                acquire_ws(dc, is_media, &worker_dst, effective_port, &init_buf, &cancel).await;
+            if let Some((ws, winner_domain)) = ws_opt {
+                STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
+                STATS.connections_ws.fetch_add(1, Ordering::Relaxed);
+                let pending_payload = if is_flowseal {
+                    initial_payload
+                } else {
+                    Vec::new()
+                };
+                bridge_socks5_ws(
+                    client,
+                    Arc::new(ws),
+                    dc,
+                    is_media,
+                    &winner_domain,
+                    cancel,
+                    detected_proto,
+                    pending_payload,
+                    Some(init_head),
+                    is_flowseal,
+                )
+                .await;
+                return;
+            }
+            lwarn!(
+                "SOCKS5 Worker upstream unavailable for DC{}; suppressing direct unproxied TCP fallback to protect connection",
+                dc
+            );
+            return;
+        }
+
+        lwarn!(
+            "SOCKS5 Worker disabled; direct TCP connection to Telegram DC{} {}:{} suppressed to prevent stalls",
+            dc,
+            worker_dst,
+            effective_port
+        );
+    } else {
+        // Non-optimistic mode: establish upstream WebSocket BEFORE sending SOCKS5 CONNECT reply
+        let host_dc = lookup_telegram_dc(&target_host);
+        let (ws_dc, mut ws_is_media) = host_dc.unwrap_or((2, false));
+        if ws_dc == 4 {
+            ws_is_media = true;
+        }
+
+        let (worker_dst, effective_port) =
+            resolve_socks5_telegram_destination(&target_host, target_port, Some(ws_dc), ws_is_media);
+
+        let ws_opt = if worker_enabled {
+            ldebug!(
+                "SOCKS5 non-optimistic pre-connecting to {} for DC{}{}: {}:{}",
+                uplink_name,
+                ws_dc,
+                if ws_is_media { " (media)" } else { "" },
+                worker_dst,
+                effective_port
+            );
+            acquire_ws(ws_dc, ws_is_media, &worker_dst, effective_port, &[], &cancel).await
+        } else {
+            lwarn!(
+                "SOCKS5 Worker disabled; direct TCP connection to Telegram DC{} {}:{} suppressed to prevent stalls",
+                ws_dc,
+                worker_dst,
+                effective_port
+            );
+            None
+        };
+
+        let (ws, winner_domain) = match ws_opt {
+            Some(pair) => pair,
+            None => {
+                if !cancel.is_cancelled() {
+                    lwarn!(
+                        "SOCKS5 upstream unavailable for DC{}; sending 0x05 connection refused",
+                        ws_dc
+                    );
+                    let _ = client
+                        .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                        .await;
+                }
+                return;
+            }
+        };
+
+        if client
+            .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await
+            .is_err()
+        {
+            let _ = ws.close().await;
+            return;
+        }
+
+        let Some(init_buf) = read_socks5_telegram_init(&mut client, &cancel).await else {
+            let _ = ws.close().await;
+            return;
+        };
+
+        if crate::proxy::is_http_transport(&init_buf[..64]) {
+            STATS.connections_http_reject.fetch_add(1, Ordering::Relaxed);
+            ldebug!("SOCKS5 rejected HTTP transport on port {}", target_port);
+            let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+            let _ = ws.close().await;
+            return;
+        }
+
+        let init_dc = dc_from_init(&init_buf[..64]);
+        let (is_media, detected_proto) = match init_dc {
+            Some((_idc, imedia, proto)) => (ws_is_media || imedia || ws_dc == 4, Some(proto)),
+            None => (ws_is_media || ws_dc == 4, None),
+        };
+
+        let mut init_head = [0u8; 64];
+        init_head.copy_from_slice(&init_buf[..64]);
+        let initial_payload = if init_buf.len() > 64 {
+            init_buf[64..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        let pending_payload = if is_flowseal {
+            let effective_dc = DC_OVERRIDES.get(&ws_dc).copied().unwrap_or(ws_dc);
+            let target_dc = if is_media { -effective_dc } else { effective_dc };
+            let patched_init_head = patch_init_dc(&init_buf[..64], target_dc);
+            if let Err(e) = ws.send(&patched_init_head).await {
+                let _ = ws.close().await;
+                lwarn!("SOCKS5 Flowseal first 64-byte handshake write failed: {:?}", e);
+                return;
+            }
+            initial_payload
+        } else {
+            if let Err(e) = ws.send(&init_buf).await {
+                let _ = ws.close().await;
+                lwarn!("SOCKS5 custom worker first packet write failed: {:?}", e);
+                return;
+            }
+            Vec::new()
+        };
+
+        STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
+        STATS.connections_ws.fetch_add(1, Ordering::Relaxed);
+
+        bridge_socks5_ws(
+            client,
+            Arc::new(ws),
+            ws_dc,
+            is_media,
+            &winner_domain,
+            cancel,
+            detected_proto,
+            pending_payload,
+            Some(init_head),
+            is_flowseal,
+        )
+        .await;
+    }
 }
 
 
@@ -681,6 +838,12 @@ pub struct Socks5Slot {
     in_flight: AtomicUsize,
 }
 
+impl Default for Socks5Slot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Socks5Slot {
     pub fn new() -> Self {
         Self {
@@ -708,7 +871,10 @@ impl Socks5Slot {
     pub fn try_pop_fresh(&self, user_domain: &str, max_age: Duration) -> Option<RawWebSocket> {
         let mut q = self.queue.lock();
         while let Some(entry) = q.pop_front() {
-            if entry.created.elapsed() < max_age && entry.domain == user_domain {
+            if !entry.ws.is_closed()
+                && entry.created.elapsed() < max_age
+                && entry.domain == user_domain
+            {
                 return Some(entry.ws);
             } else {
                 spawn_task(async move {
@@ -719,13 +885,13 @@ impl Socks5Slot {
         None
     }
 
-    pub fn push_if_below(&self, entry: Socks5WarmEntry, target: usize) -> Result<(), Socks5WarmEntry> {
+    pub fn push_if_below(&self, entry: Socks5WarmEntry, target: usize) -> Result<(), Box<Socks5WarmEntry>> {
         let mut q = self.queue.lock();
         if q.len() < target {
             q.push_back(entry);
             Ok(())
         } else {
-            Err(entry)
+            Err(Box::new(entry))
         }
     }
 
@@ -1446,17 +1612,17 @@ pub async fn bridge_socks5_ws(
         }
     };
 
-    let (mut splitter, mut clt_dec, mut tg_enc) = if is_flowseal && init_head.is_some() {
-        let head = init_head.unwrap();
-        let p = proto.unwrap_or(0xEFEFEFEF);
-        let s = MsgSplitter::new(p);
-        let mut d = new_aes_ctr(&head[8..40], &head[40..56]);
-        let mut dummy = [0u8; 64];
-        d.xor(&mut dummy);
-        let e = d.clone();
-        (Some(s), Some(d), Some(e))
-    } else {
-        (None, None, None)
+    let (mut splitter, mut clt_dec, mut tg_enc) = match (is_flowseal, init_head) {
+        (true, Some(head)) => {
+            let p = proto.unwrap_or(0xEFEFEFEF);
+            let s = MsgSplitter::new(p);
+            let mut d = new_aes_ctr(&head[8..40], &head[40..56]);
+            let mut dummy = [0u8; 64];
+            d.xor(&mut dummy);
+            let e = d.clone();
+            (Some(s), Some(d), Some(e))
+        }
+        _ => (None, None, None),
     };
 
     // Up: Client -> WS
@@ -1741,13 +1907,12 @@ pub async fn bridge_socks5_stream<S>(
 ) where
     S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Send + Unpin + 'static,
 {
-    if !initial_downlink.is_empty() {
-        if bounded_write(&mut client, &initial_downlink, &cancel_token, BRIDGE_WRITE_TIMEOUT)
+    if !initial_downlink.is_empty()
+        && bounded_write(&mut client, &initial_downlink, &cancel_token, BRIDGE_WRITE_TIMEOUT)
             .await
             .is_err()
-        {
-            return;
-        }
+    {
+        return;
     }
     let _ = tokio::select! {
         _ = cancel_token.cancelled() => Ok((0, 0)),
@@ -1918,5 +2083,106 @@ mod tests {
             resolve_socks5_telegram_destination("149.154.167.50", 443, Some(2), false);
         assert_eq!(dst, "149.154.167.51");
         assert_eq!(port, 443);
+    }
+
+    static SOCKS5_OPT_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    struct RestoreSocks5Opt {
+        optimistic: bool,
+        cf_enabled: bool,
+        cf_domain: String,
+        uplink_mode: i32,
+    }
+    impl Drop for RestoreSocks5Opt {
+        fn drop(&mut self) {
+            SOCKS5_OPTIMISTIC_RESPONSE.store(self.optimistic, Ordering::Relaxed);
+            CFPROXY_ENABLED.store(self.cf_enabled, Ordering::Relaxed);
+            CFPROXY.write().user_domain = self.cf_domain.clone();
+            set_socks5_uplink_mode(self.uplink_mode);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn socks5_optimistic_vs_non_optimistic_reply_ordering_and_failure() {
+        let _lock = SOCKS5_OPT_TEST_LOCK.lock();
+        let _restore = RestoreSocks5Opt {
+            optimistic: SOCKS5_OPTIMISTIC_RESPONSE.load(Ordering::Relaxed),
+            cf_enabled: CFPROXY_ENABLED.load(Ordering::Relaxed),
+            cf_domain: CFPROXY.read().user_domain.clone(),
+            uplink_mode: get_socks5_uplink_mode(),
+        };
+
+        CFPROXY_ENABLED.store(true, Ordering::Relaxed);
+        CFPROXY.write().user_domain = "worker.example.com".to_string();
+        set_socks5_uplink_mode(SOCKS5_UPLINK_WORKER);
+
+        // 1. Non-optimistic mode (false): does NOT send 0x05 0x00 before acquire_ws finishes,
+        //    and sends 0x05 0x05 when upstream fails.
+        SOCKS5_OPTIMISTIC_RESPONSE.store(false, Ordering::Relaxed);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (server_side, _) = listener.accept().await.unwrap();
+
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let cancel = CancellationToken::new();
+        let server_task = tokio::spawn(async move {
+            handle_socks5_telegram_client(
+                server_side,
+                "149.154.167.51".to_string(),
+                443,
+                cancel,
+                |_dc, _media, _dst, _port, _init, _cancel| async move {
+                    let _ = gate_rx.await;
+                    None
+                },
+            )
+            .await;
+        });
+
+        let mut reply = [0u8; 10];
+        let early_read =
+            tokio::time::timeout(Duration::from_millis(60), client.read_exact(&mut reply)).await;
+        assert!(
+            early_read.is_err(),
+            "non-optimistic SOCKS5 must not reply before upstream acquire completes"
+        );
+
+        let _ = gate_tx.send(());
+        client
+            .read_exact(&mut reply)
+            .await
+            .expect("read 0x05 0x05 failure reply");
+        assert_eq!(reply, [0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+        server_task.await.unwrap();
+
+        // 2. Optimistic mode (true): sends 0x05 0x00 immediately before reading 64-byte init
+        //    or calling acquire_ws.
+        SOCKS5_OPTIMISTIC_RESPONSE.store(true, Ordering::Relaxed);
+        let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        let mut client2 = TcpStream::connect(addr2).await.unwrap();
+        let (server_side2, _) = listener2.accept().await.unwrap();
+
+        let cancel2 = CancellationToken::new();
+        let server_task2 = tokio::spawn(async move {
+            handle_socks5_telegram_client(
+                server_side2,
+                "149.154.167.51".to_string(),
+                443,
+                cancel2,
+                |_dc, _media, _dst, _port, _init, _cancel| async move { None },
+            )
+            .await;
+        });
+
+        let mut reply2 = [0u8; 10];
+        tokio::time::timeout(Duration::from_secs(1), client2.read_exact(&mut reply2))
+            .await
+            .expect("optimistic reply timeout")
+            .expect("optimistic reply read");
+        assert_eq!(reply2, [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+        drop(client2);
+        server_task2.await.unwrap();
     }
 }

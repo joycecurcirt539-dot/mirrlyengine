@@ -30,6 +30,12 @@ struct BridgeActivityState {
     transport_checker: Option<Arc<dyn Fn() -> (Duration, bool) + Send + Sync>>,
 }
 
+impl Default for BridgeActivity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BridgeActivity {
     pub fn new() -> Self {
         let now = tokio::time::Instant::now();
@@ -71,20 +77,12 @@ impl BridgeActivity {
         state.last_transport = now;
     }
 
-    pub fn touch_transport(&self) {
-        self.state.lock().last_transport = tokio::time::Instant::now();
-    }
-
     /// WS cannot carry a TCP FIN. Drain responses until peer close or data-idle timeout.
     /// Pongs do not keep a half-closed application session alive indefinitely.
     pub fn upload_eof(&self) {
         let mut state = self.state.lock();
         state.last_data = tokio::time::Instant::now();
         state.half_closed = true;
-    }
-
-    pub fn is_half_closed(&self) -> bool {
-        self.state.lock().half_closed
     }
 
     pub async fn wait<F: Future>(

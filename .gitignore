@@ -1,5 +1,7 @@
 /target/
+/test_build/
 **/*.rs.bk
+*.apk
 *.pdb
 *.dll
 *.lib

@@ -9,12 +9,13 @@ pub mod faketls;
 pub mod generation_guard;
 pub mod network_profile;
 pub mod node_independence;
+pub mod platform;
+pub mod prober;
 pub mod proxy;
 pub mod recovery;
 pub mod socks5;
 pub mod tls_observability;
 pub mod ws;
-pub mod platform;
 
 pub use cfproxy::ProtoScope;
 
@@ -100,6 +101,36 @@ struct Socks5State {
 
 static MTPROTO_STATE: OnceCell<Mutex<Option<MtprotoState>>> = OnceCell::new();
 static SOCKS5_STATE: OnceCell<Mutex<Option<Socks5State>>> = OnceCell::new();
+static LAST_START_ERROR: OnceCell<Mutex<Option<String>>> = OnceCell::new();
+
+pub type ProtectCallback = extern "C" fn(c_int) -> c_int;
+static PROTECT_SOCKET_CB: parking_lot::RwLock<Option<ProtectCallback>> =
+    parking_lot::RwLock::new(None);
+
+#[no_mangle]
+pub unsafe extern "C" fn SetProtectSocketCallback(cb: Option<ProtectCallback>) {
+    *PROTECT_SOCKET_CB.write() = cb;
+}
+
+pub fn protect_socket_fd(fd: c_int) -> bool {
+    if let Some(cb) = *PROTECT_SOCKET_CB.read() {
+        cb(fd) != 0
+    } else {
+        true
+    }
+}
+
+fn last_start_error_cell() -> &'static Mutex<Option<String>> {
+    LAST_START_ERROR.get_or_init(|| Mutex::new(None))
+}
+
+fn clear_last_start_error() {
+    *last_start_error_cell().lock() = None;
+}
+
+fn set_last_start_error(message: impl Into<String>) {
+    *last_start_error_cell().lock() = Some(message.into());
+}
 
 fn mtproto_state_cell() -> &'static Mutex<Option<MtprotoState>> {
     MTPROTO_STATE.get_or_init(|| Mutex::new(None))
@@ -123,10 +154,10 @@ fn abort_and_wait_listener_drop(
 }
 
 fn map_bind_error(err_kind: std::io::ErrorKind) -> c_int {
-    if err_kind == std::io::ErrorKind::AddrInUse {
-        -1
-    } else {
-        -2
+    match err_kind {
+        std::io::ErrorKind::AddrInUse => -3,
+        std::io::ErrorKind::PermissionDenied => -4,
+        _ => -5,
     }
 }
 
@@ -196,10 +227,12 @@ pub unsafe extern "C" fn StartProxy(
     verbose: c_int,
 ) -> c_int {
     if port < 0 || port > u16::MAX as c_int {
-        return -2;
+        set_last_start_error(format!("Invalid MTProto listen port: {}", port));
+        return -5;
     }
 
     init_crypto_and_panic_hook();
+    clear_last_start_error();
 
     let cell = mtproto_state_cell();
     let mut guard = cell.lock();
@@ -227,17 +260,8 @@ pub unsafe extern "C" fn StartProxy(
     node_independence::NODE_INDEPENDENCE_TRACKER.write().reset();
     tls_observability::TLS_TRACKER.write().reset();
 
-    if secret_str.len() >= 32 {
-        let clean_sec = if secret_str.starts_with("ee") && secret_str.len() >= 34 {
-            &secret_str[2..34]
-        } else if secret_str.starts_with("dd") && secret_str.len() == 34 {
-            &secret_str[2..34]
-        } else {
-            &secret_str[..32]
-        };
-        if hex::decode(clean_sec).is_ok() {
-            *PROXY_SECRET.write() = clean_sec.to_string();
-        }
+    if !secret_str.trim().is_empty() {
+        let _ = config::apply_proxy_secret_input(&secret_str);
     }
 
     let dc_opt_map: HashMap<i32, String> = HashMap::new();
@@ -288,19 +312,19 @@ pub unsafe extern "C" fn StartProxy(
         Ok(Ok(p)) => p,
         Ok(Err((kind, msg))) => {
             abort_and_wait_listener_drop(handle, cancel_tasks, done_rx);
+            set_last_start_error(msg.clone());
             crate::lwarn!("StartProxy bind error: {}", msg);
             return map_bind_error(kind);
         }
         Err(_) => {
             abort_and_wait_listener_drop(handle, cancel_tasks, done_rx);
-            return -3;
+            set_last_start_error(format!(
+                "MTProto listen on {}:{} aborted before bind completed",
+                host, go_port
+            ));
+            return -5;
         }
     };
-
-    let cancel_balancer = cancel_tasks.clone();
-    rt.spawn(async move {
-        cfproxy::start_background_balancer_loop(cancel_balancer).await;
-    });
 
     *guard = Some(MtprotoState {
         pool,
@@ -323,10 +347,12 @@ pub unsafe extern "C" fn StartSocks5Proxy(
     verbose: c_int,
 ) -> c_int {
     if port < 0 || port > u16::MAX as c_int {
-        return -2;
+        set_last_start_error(format!("Invalid SOCKS5 listen port: {}", port));
+        return -5;
     }
 
     init_crypto_and_panic_hook();
+    clear_last_start_error();
 
     let cell = socks5_state_cell();
     let mut guard = cell.lock();
@@ -392,12 +418,17 @@ pub unsafe extern "C" fn StartSocks5Proxy(
         Ok(Ok(p)) => p,
         Ok(Err((kind, msg))) => {
             abort_and_wait_listener_drop(handle, cancel_tasks, done_rx);
+            set_last_start_error(msg.clone());
             crate::lwarn!("StartSocks5Proxy bind error: {}", msg);
             return map_bind_error(kind);
         }
         Err(_) => {
             abort_and_wait_listener_drop(handle, cancel_tasks, done_rx);
-            return -3;
+            set_last_start_error(format!(
+                "SOCKS5 listen on {}:{} aborted before bind completed",
+                host, go_port
+            ));
+            return -5;
         }
     };
 
@@ -547,8 +578,6 @@ pub(crate) fn reset_network_sockets_for_reason(reason: &str) {
         }
     }
 
-    DC_FAIL_UNTIL.write().clear();
-    WS_BLACKLIST.write().clear();
     balancer::BALANCER.write().reset_ranking();
     node_independence::NODE_INDEPENDENCE_TRACKER.write().reset();
     socks5::clear_socks5_warm_pool();
@@ -564,8 +593,6 @@ pub(crate) fn reset_network_routing_for_reason_if_current(
             "ResetNetworkRouting: rotating candidate endpoints and DoH cache reason={} (keeping active data sessions intact)",
             reason
         );
-        DC_FAIL_UNTIL.write().clear();
-        WS_BLACKLIST.write().clear();
         balancer::BALANCER.write().reset_ranking();
         node_independence::NODE_INDEPENDENCE_TRACKER.write().reset();
     })
@@ -672,11 +699,6 @@ pub extern "C" fn SetPoolSize(size: c_int) -> c_int {
         effective
     );
     effective
-}
-
-#[no_mangle]
-pub extern "C" fn set_pool_size(size: c_int) -> c_int {
-    SetPoolSize(size)
 }
 
 #[no_mangle]
@@ -924,30 +946,9 @@ pub unsafe extern "C" fn PromoteCfproxyDomainForDc(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn SetWorkerProtocol(_c_domain: *const c_char, _proto_ver: c_int) {
-    // Protocol is unified to modern WSS relay (/apiws); proto_ver subnegotiation is deprecated.
-    // Retained for backward FFI binary compatibility with JNA bindings.
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn SetSecret(c_secret: *const c_char) {
     let s = cstr_to_string(c_secret);
-    if s.len() < 32 {
-        return;
-    }
-    let clean_sec = if s.starts_with("ee") && s.len() >= 34 {
-        &s[2..34]
-    } else if s.starts_with("dd") && s.len() == 34 {
-        &s[2..34]
-    } else if s.len() == 32 {
-        &s[..32]
-    } else {
-        return;
-    };
-    if hex::decode(clean_sec).is_err() {
-        return;
-    }
-    *PROXY_SECRET.write() = clean_sec.to_string();
+    let _ = config::apply_proxy_secret_input(&s);
 }
 
 #[no_mangle]
@@ -1005,15 +1006,8 @@ pub extern "C" fn GetStatsJson() -> *mut c_char {
 
 #[no_mangle]
 pub extern "C" fn GetSecretWithPrefix() -> *mut c_char {
-    let sec = PROXY_SECRET.read().clone();
-    CString::new(format!("dd{}", sec))
-        .unwrap_or_default()
-        .into_raw()
-}
-
-#[no_mangle]
-pub extern "C" fn GetUsefulRxSliJson() -> *mut c_char {
-    CString::new("{}").unwrap_or_default().into_raw()
+    let secret = config::format_secret_with_prefix(ws::is_tls_enabled());
+    CString::new(secret).unwrap_or_default().into_raw()
 }
 
 #[no_mangle]
@@ -1047,6 +1041,169 @@ pub extern "C" fn GetNodeIndependenceStatusJson() -> *mut c_char {
 pub extern "C" fn GetTlsObservabilityStatusJson() -> *mut c_char {
     let s = tls_observability::TLS_TRACKER.read().get_status_json();
     CString::new(s).unwrap_or_default().into_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn GetUsefulRxSliJson() -> *mut c_char {
+    let pool_opt = mtproto_state_cell().lock().as_ref().map(|s| s.pool.clone());
+    let bal = balancer::BALANCER.read().get_health_summary();
+    let tls_on = ws::is_tls_enabled();
+    let tls_stats = if tls_on {
+        Some(tls_observability::TLS_TRACKER.read().get_status())
+    } else {
+        None
+    };
+
+    let (warm_ready, warm_target, warm_inflight, transport_name) = if let Some(pool) = pool_opt {
+        let wp = pool.warm_pool_status();
+        (wp.ready_total, wp.target_total, wp.in_flight_total, "mtproto")
+    } else {
+        let wp = socks5::get_socks5_warm_pool_status();
+        (wp.ready_total, wp.target_total, wp.in_flight_total, "socks5")
+    };
+
+    let active_conns = STATS.connections_active.load(Ordering::Relaxed);
+    let total_conns = STATS.connections_total.load(Ordering::Relaxed);
+    let ws_total = STATS.connections_ws.load(Ordering::Relaxed);
+    let cf_total = STATS.connections_cfproxy.load(Ordering::Relaxed);
+    let fastpath_hits = STATS.socks5_fastpath_hits.load(Ordering::Relaxed);
+    let bad_conns = STATS.connections_bad.load(Ordering::Relaxed);
+    let ws_errors = STATS.ws_errors.load(Ordering::Relaxed);
+    let pool_hits = STATS.pool_hits.load(Ordering::Relaxed);
+    let pool_misses = STATS.pool_misses.load(Ordering::Relaxed);
+    let mtproto_429 = STATS.mtproto_429_cooldown_hits.load(Ordering::Relaxed);
+    let socks5_429 = STATS.socks5_429_cooldown_hits.load(Ordering::Relaxed);
+    let rx_bytes = STATS.bytes_down.load(Ordering::Relaxed);
+    let tx_bytes = STATS.bytes_up.load(Ordering::Relaxed);
+    let tls_failures = tls_stats
+        .as_ref()
+        .map(|t| t.total_handshake_failures)
+        .unwrap_or(0);
+
+    let json = serde_json::json!({
+        "transport": transport_name,
+        "tls_enabled": tls_on,
+        "active_conns": active_conns,
+        "connections_total": total_conns,
+        "connections_ws": ws_total,
+        "connections_cfproxy": cf_total,
+        "connections_awg": 0,
+        "socks5_v2_sessions": 0,
+        "socks5_v1_downgrades": 0,
+        "socks5_fastpath_hits": fastpath_hits,
+        "socks5_fallback_triggers": 0,
+        "connections_bad": bad_conns,
+        "ws_errors": ws_errors,
+        "pool_hits": pool_hits,
+        "pool_misses": pool_misses,
+        "warm_ready": warm_ready,
+        "warm_target": warm_target,
+        "warm_inflight": warm_inflight,
+        "mtproto_429_hits": mtproto_429,
+        "socks5_429_hits": socks5_429,
+        "rx_bytes": rx_bytes,
+        "tx_bytes": tx_bytes,
+        "tls_failures": tls_failures,
+        "balancer_active_domain": bal.active_domain,
+        "balancer_healthy_domains": bal.healthy_domain_count,
+        "balancer_total_domains": bal.total_domain_count,
+        "balancer_min_rtt_ms": bal.min_probe_rtt_ms,
+        "balancer_median_rtt_ms": bal.median_probe_rtt_ms,
+        "balancer_useful_success_count": bal.total_useful_success_count,
+        "balancer_failure_count": bal.total_failure_count,
+        "vpn_established": false,
+    })
+    .to_string();
+
+    CString::new(json).unwrap_or_default().into_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn GetLastStartError() -> *mut c_char {
+    let msg = last_start_error_cell().lock().clone().unwrap_or_default();
+    CString::new(msg).unwrap_or_default().into_raw()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PingHost(
+    c_host: *const c_char,
+    port: c_int,
+    timeout_ms: c_int,
+) -> *mut c_char {
+    init_crypto_and_panic_hook();
+    let host = cstr_to_string(c_host);
+    let p = if port <= 0 || port > u16::MAX as c_int {
+        443
+    } else {
+        port as u16
+    };
+    let to_ms = if timeout_ms <= 0 {
+        2500
+    } else {
+        timeout_ms as u64
+    };
+    let rt = runtime();
+    let (success, rtt_ms, ip_or_err) =
+        rt.block_on(async { prober::ping_tcp_host(&host, p, to_ms).await });
+    let json_val = if success {
+        serde_json::json!({
+            "success": true,
+            "rtt_ms": rtt_ms,
+            "ip": ip_or_err
+        })
+    } else {
+        serde_json::json!({
+            "success": false,
+            "rtt_ms": -1,
+            "error": ip_or_err
+        })
+    };
+    CString::new(json_val.to_string())
+        .unwrap_or_default()
+        .into_raw()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PingWorker(
+    c_domain: *const c_char,
+    timeout_ms: c_int,
+) -> *mut c_char {
+    init_crypto_and_panic_hook();
+    let domain = cstr_to_string(c_domain);
+    let to_ms = if timeout_ms <= 0 {
+        5000
+    } else {
+        timeout_ms as u64
+    };
+    let rt = runtime();
+    let (status, rtt_opt) =
+        rt.block_on(async { prober::ping_worker_endpoint(&domain, to_ms).await });
+    let json_val = serde_json::json!({
+        "status": status,
+        "rtt_ms": rtt_opt
+    });
+    CString::new(json_val.to_string())
+        .unwrap_or_default()
+        .into_raw()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ProbeTransportHealth(
+    mode: c_int,
+    c_domain: *const c_char,
+    timeout_ms: c_int,
+) -> *mut c_char {
+    init_crypto_and_panic_hook();
+    let domain = cstr_to_string(c_domain);
+    let to_ms = if timeout_ms <= 0 {
+        2500
+    } else {
+        timeout_ms as u64
+    };
+    let rt = runtime();
+    let res = rt.block_on(async { prober::probe_transport_health(mode, &domain, to_ms).await });
+    let json = serde_json::to_string(&res).unwrap_or_else(|_| "{}".to_string());
+    CString::new(json).unwrap_or_default().into_raw()
 }
 
 #[no_mangle]
@@ -1112,6 +1269,14 @@ mod jni_bridge {
         new_utf_fn(env, c_str.as_ptr())
     }
 
+    fn map_jni_start_error(code: c_int) -> &'static str {
+        if code == -3 {
+            "PORT_BUSY"
+        } else {
+            "BIND_FAILED"
+        }
+    }
+
     #[no_mangle]
     pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeStartSocks5(
         env: JNIEnv,
@@ -1127,10 +1292,8 @@ mod jni_bridge {
         let code = StartSocks5Proxy(c_ip.as_ptr(), port, 1);
         if code == 0 {
             std::ptr::null_mut()
-        } else if code == -1 {
-            jni_new_string(env, "PORT_BUSY")
         } else {
-            jni_new_string(env, "BIND_FAILED")
+            jni_new_string(env, map_jni_start_error(code))
         }
     }
 
@@ -1163,10 +1326,8 @@ mod jni_bridge {
         let code = StartProxy(c_ip.as_ptr(), port, c_up.as_ptr(), c_sec.as_ptr(), 1);
         if code == 0 {
             std::ptr::null_mut()
-        } else if code == -1 {
-            jni_new_string(env, "PORT_BUSY")
         } else {
-            jni_new_string(env, "BIND_FAILED")
+            jni_new_string(env, map_jni_start_error(code))
         }
     }
 
@@ -1317,6 +1478,33 @@ mod jni_bridge {
         _class: JClass,
     ) {
         ResetNetworkSockets();
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn map_jni_start_error_maps_addr_in_use_to_port_busy() {
+            assert_eq!(map_jni_start_error(-3), "PORT_BUSY");
+            assert_eq!(map_jni_start_error(-4), "BIND_FAILED");
+            assert_eq!(map_jni_start_error(-5), "BIND_FAILED");
+            assert_eq!(map_jni_start_error(-1), "BIND_FAILED");
+        }
+    }
+}
+
+#[cfg(test)]
+mod bind_error_tests {
+    use super::*;
+
+    #[test]
+    fn map_bind_error_matches_mirrly_contract() {
+        assert_eq!(map_bind_error(std::io::ErrorKind::AddrInUse), -3);
+        assert_eq!(map_bind_error(std::io::ErrorKind::PermissionDenied), -4);
+        assert_eq!(map_bind_error(std::io::ErrorKind::InvalidInput), -5);
+        assert_eq!(map_bind_error(std::io::ErrorKind::AddrNotAvailable), -5);
+        assert_eq!(map_bind_error(std::io::ErrorKind::Other), -5);
     }
 }
 

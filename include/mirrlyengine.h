@@ -21,11 +21,27 @@ enum {
     MIRRLY_SOCKS5_UPLINK_FLOWSEAL = 1
 };
 
+/** Return codes for StartProxy and StartSocks5Proxy. */
+enum {
+    MIRRLY_START_OK = 0,
+    MIRRLY_START_ERR_GENERAL = -1,
+    MIRRLY_START_ERR_ADDR_IN_USE = -3,
+    MIRRLY_START_ERR_PERMISSION_DENIED = -4,
+    MIRRLY_START_ERR_OTHER = -5
+};
+
 /**
  * Host log callback signature.
  * The `message` pointer is only valid for the duration of the callback invocation.
  */
 typedef void (*mirrly_log_callback_t)(int level, const char* message, void* user_data);
+
+/**
+ * Optional host socket-protection callback (e.g. Android VpnService.protect(fd)).
+ * Return non-zero on success, 0 on failure.
+ */
+typedef int (*mirrly_protect_socket_callback_t)(int fd);
+void SetProtectSocketCallback(mirrly_protect_socket_callback_t callback);
 
 /* -------------------------------------------------------------------------- */
 /* Lifecycle & Ports                                                          */
@@ -35,7 +51,10 @@ typedef void (*mirrly_log_callback_t)(int level, const char* message, void* user
  * Starts the local MTProto proxy listener on `host:port`.
  * Pass `port = 0` to let the OS assign an ephemeral free port, then query
  * `GetMtprotoListenPort()`.
- * Returns `0` on success, `-1` if the port is already in use, `< -1` on error.
+ * Returns `0` (`MIRRLY_START_OK`) on success, `-3` (`MIRRLY_START_ERR_ADDR_IN_USE`) if the
+ * port is already in use, `-4` (`MIRRLY_START_ERR_PERMISSION_DENIED`) on permission denied,
+ * `-5` (`MIRRLY_START_ERR_OTHER`) on invalid arguments or other bind errors, or `-1`
+ * (`MIRRLY_START_ERR_GENERAL`) on general start failure.
  */
 int StartProxy(const char* host, int port, const char* dc_ips, const char* secret, int verbose);
 
@@ -43,7 +62,10 @@ int StartProxy(const char* host, int port, const char* dc_ips, const char* secre
  * Starts the local SOCKS5 proxy listener on `host:port`.
  * Pass `port = 0` to let the OS assign an ephemeral free port, then query
  * `GetSocks5ListenPort()`.
- * Returns `0` on success, `-1` if the port is already in use, `< -1` on error.
+ * Returns `0` (`MIRRLY_START_OK`) on success, `-3` (`MIRRLY_START_ERR_ADDR_IN_USE`) if the
+ * port is already in use, `-4` (`MIRRLY_START_ERR_PERMISSION_DENIED`) on permission denied,
+ * `-5` (`MIRRLY_START_ERR_OTHER`) on invalid arguments or other bind errors, or `-1`
+ * (`MIRRLY_START_ERR_GENERAL`) on general start failure.
  */
 int StartSocks5Proxy(const char* host, int port, int verbose);
 
@@ -84,7 +106,6 @@ void OnScreenWakeup(void);
 
 int SetMtprotoStandbyPerActiveSlot(int size);
 int SetPoolSize(int size);
-int set_pool_size(int size);
 
 void SetIpv6OnlyNetwork(int is_ipv6_only);
 void SetNetworkProfile(int is_mobile);
@@ -114,7 +135,6 @@ void SetTcpNoDelay(int enabled);
 void SetCfProxyCacheDir(const char* cache_dir);
 void SetCfProxyConfig(int enabled, const char* user_domain);
 int PromoteCfproxyDomainForDc(int dc_id, int is_media, const char* domain);
-void SetWorkerProtocol(const char* domain, int proto_ver);
 
 void SetTlsEnabled(int enabled);
 int IsTlsEnabled(void);
@@ -140,15 +160,24 @@ int GetSocks5UplinkMode(void);
 /** Caller must free every string returned by Get* functions via FreeString(). */
 char* GetStats(void);
 char* GetStatsJson(void);
+char* GetUsefulRxSliJson(void);
+char* GetLastStartError(void);
 char* GetTransportPoolStatusJson(void);
 char* GetWarmPoolStatusJson(void);
-char* GetUsefulRxSliJson(void);
 char* GetDomainBalancerStatusJson(void);
 char* GetDialBudgetStatsJson(void);
 char* GetNodeIndependenceStatusJson(void);
 char* GetTlsObservabilityStatusJson(void);
 
-/** Frees any string allocated and returned by mirrlyengine Get* functions. */
+/* -------------------------------------------------------------------------- */
+/* Network Diagnostics & Transport Probing (Free returned strings via FreeString) */
+/* -------------------------------------------------------------------------- */
+
+char* PingHost(const char* host, int port, int timeout_ms);
+char* PingWorker(const char* domain, int timeout_ms);
+char* ProbeTransportHealth(int mode, const char* domain, int timeout_ms);
+
+/** Frees any string allocated and returned by mirrlyengine Get, Ping, or Probe functions. */
 void FreeString(char* ptr);
 
 #ifdef __cplusplus

@@ -3,22 +3,6 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use std::time::{Duration, Instant};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum AddressFamily {
-    Ipv4,
-    Ipv6,
-}
-
-impl AddressFamily {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            AddressFamily::Ipv4 => "IPv4",
-            AddressFamily::Ipv6 => "IPv6",
-        }
-    }
-}
 
 pub fn infer_asn(ip: &IpAddr) -> &'static str {
     match ip {
@@ -32,19 +16,14 @@ pub fn infer_asn(ip: &IpAddr) -> &'static str {
             // 188.114.96.0/20
             // 108.162.192.0/18
             // 141.101.64.0/18
-            if o[0] == 104 && (o[1] >= 16 && o[1] <= 31) {
-                "AS13335 (Cloudflare)"
-            } else if o[0] == 172 && (o[1] >= 64 && o[1] <= 71) {
-                "AS13335 (Cloudflare)"
-            } else if o[0] == 162 && (o[1] == 158 || o[1] == 159) {
-                "AS13335 (Cloudflare)"
-            } else if o[0] == 198 && o[1] == 41 {
-                "AS13335 (Cloudflare)"
-            } else if o[0] == 188 && o[1] == 114 {
-                "AS13335 (Cloudflare)"
-            } else if o[0] == 108 && o[1] == 162 {
-                "AS13335 (Cloudflare)"
-            } else if o[0] == 141 && o[1] == 101 {
+            let is_cloudflare = (o[0] == 104 && (16..=31).contains(&o[1]))
+                || (o[0] == 172 && (64..=71).contains(&o[1]))
+                || (o[0] == 162 && (o[1] == 158 || o[1] == 159))
+                || (o[0] == 198 && o[1] == 41)
+                || (o[0] == 188 && o[1] == 114)
+                || (o[0] == 108 && o[1] == 162)
+                || (o[0] == 141 && o[1] == 101);
+            if is_cloudflare {
                 "AS13335 (Cloudflare)"
             } else {
                 "AS-DIRECT (IPv4)"
@@ -53,9 +32,9 @@ pub fn infer_asn(ip: &IpAddr) -> &'static str {
         IpAddr::V6(v6) => {
             let s = v6.segments();
             // Cloudflare IPv6: 2606:4700::/32, 2a06:98c0::/29
-            if s[0] == 0x2606 && s[1] == 0x4700 {
-                "AS13335 (Cloudflare IPv6)"
-            } else if s[0] == 0x2a06 && (s[1] & 0xffc0) == 0x98c0 {
+            let is_cloudflare =
+                (s[0] == 0x2606 && s[1] == 0x4700) || (s[0] == 0x2a06 && (s[1] & 0xffc0) == 0x98c0);
+            if is_cloudflare {
                 "AS13335 (Cloudflare IPv6)"
             } else {
                 "AS-DIRECT (IPv6)"
@@ -139,10 +118,6 @@ pub struct NodeTelemetry {
     pub asn: String,
     pub bytes_before_stall: u64,
     pub total_bytes_transferred: u64,
-    pub downlink_ewma_bps: f64,
-    pub downlink_samples: u32,
-    #[serde(skip)]
-    last_downlink_sample: Option<Instant>,
     pub success_count: u64,
     pub failure_count: u64,
     pub consecutive_failures: u32,
@@ -160,9 +135,6 @@ impl NodeTelemetry {
             asn: "UNKNOWN".to_string(),
             bytes_before_stall: 0,
             total_bytes_transferred: 0,
-            downlink_ewma_bps: 0.0,
-            downlink_samples: 0,
-            last_downlink_sample: None,
             success_count: 0,
             failure_count: 0,
             consecutive_failures: 0,
@@ -202,6 +174,12 @@ pub struct NodeIndependenceTracker {
 
 pub static NODE_INDEPENDENCE_TRACKER: Lazy<RwLock<NodeIndependenceTracker>> =
     Lazy::new(|| RwLock::new(NodeIndependenceTracker::new()));
+
+impl Default for NodeIndependenceTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl NodeIndependenceTracker {
     pub fn new() -> Self {
@@ -311,39 +289,6 @@ impl NodeIndependenceTracker {
             .or_insert_with(|| NodeTelemetry::new(domain_norm));
 
         entry.total_bytes_transferred = entry.total_bytes_transferred.saturating_add(bytes);
-    }
-
-    /// Only sizeable completed downlink windows describe media throughput.
-    pub fn record_downlink_sample(&mut self, domain: &str, bytes: u64, elapsed: Duration) {
-        if bytes < 512 * 1024 {
-            return;
-        }
-        let domain_norm = crate::balancer::normalize_domain(domain);
-        if domain_norm.is_empty() {
-            return;
-        }
-        let entry = self.nodes.entry(domain_norm.clone())
-            .or_insert_with(|| NodeTelemetry::new(domain_norm));
-        let bps = bytes as f64 / elapsed.as_secs_f64().max(0.001);
-        entry.downlink_ewma_bps = if entry.downlink_samples == 0 {
-            bps
-        } else {
-            0.3 * bps + 0.7 * entry.downlink_ewma_bps
-        };
-        entry.downlink_samples = entry.downlink_samples.saturating_add(1);
-        entry.last_downlink_sample = Some(Instant::now());
-    }
-
-    pub fn fresh_downlink_bps(&self, domain: &str) -> Option<f64> {
-        let norm = crate::balancer::normalize_domain(domain);
-        let node = self.nodes.get(&norm)?;
-        if node.downlink_samples > 0 && node.consecutive_failures == 0
-            && node.last_downlink_sample?.elapsed() < Duration::from_secs(10 * 60)
-        {
-            Some(node.downlink_ewma_bps)
-        } else {
-            None
-        }
     }
 
     pub fn record_node_failure(&mut self, domain: &str, ip: Option<IpAddr>, colo: Option<&str>) {
@@ -494,11 +439,6 @@ impl NodeIndependenceTracker {
         }
 
         selected
-    }
-
-    pub fn get_telemetry(&self, domain: &str) -> Option<NodeTelemetry> {
-        let norm = crate::balancer::normalize_domain(domain);
-        self.nodes.get(&norm).cloned()
     }
 
     pub fn get_all_telemetry_json(&self) -> String {
