@@ -991,36 +991,57 @@ pub fn trigger_warm_socks5_refill(user_domain: String, dc: i32, is_media: bool, 
                 let timeout = crate::config::adaptive_ws_connect_timeout().max(8.0);
                 let (ws_opt, domain_tag) = if is_flowseal {
                     let effective_dc = DC_OVERRIDES.get(&dc).copied().unwrap_or(dc);
-                    let (_enabled, mut domains) = {
-                        let cfg = CFPROXY.read();
-                        (CFPROXY_ENABLED.load(Ordering::Relaxed), cfg.domains.clone())
+                    let per_dc = crate::config::is_flowseal_per_dc_enabled();
+                    let domain_base = if per_dc {
+                        let candidates = crate::cfproxy::select_flowseal_candidates_for_dc(
+                            effective_dc,
+                            is_media,
+                            ProtoScope::Socks5,
+                            None,
+                        );
+                        if candidates.is_empty() {
+                            return;
+                        }
+                        candidates[0].clone()
+                    } else {
+                        let (_enabled, mut domains) = {
+                            let cfg = CFPROXY.read();
+                            (CFPROXY_ENABLED.load(Ordering::Relaxed), cfg.domains.clone())
+                        };
+                        if domains.is_empty() {
+                            domains = crate::cfproxy::default_cfproxy_domains();
+                        }
+                        let ordered = crate::balancer::BALANCER
+                            .read()
+                            .get_domains_for_dc(effective_dc, is_media);
+                        let mut candidates = Vec::new();
+                        for d in ordered {
+                            let norm = crate::balancer::normalize_domain(&d);
+                            if !norm.is_empty()
+                                && cfproxy_429_cooldown_remaining_scoped(&norm, ProtoScope::Socks5)
+                                    == Duration::ZERO
+                            {
+                                candidates.push(norm);
+                            }
+                        }
+                        for d in &domains {
+                            let norm = crate::balancer::normalize_domain(d);
+                            if !norm.is_empty()
+                                && !candidates.contains(&norm)
+                                && cfproxy_429_cooldown_remaining_scoped(&norm, ProtoScope::Socks5)
+                                    == Duration::ZERO
+                            {
+                                candidates.push(norm);
+                            }
+                        }
+                        if candidates.is_empty() {
+                            candidates = crate::cfproxy::default_cfproxy_domains();
+                        }
+                        candidates[rand::random::<usize>() % candidates.len()].clone()
                     };
-                    if domains.is_empty() {
-                        domains = crate::cfproxy::default_cfproxy_domains();
-                    }
-                    let ordered = crate::balancer::BALANCER
-                        .read()
-                        .get_domains_for_dc(effective_dc, is_media);
-                    let mut candidates = Vec::new();
-                    for d in ordered {
-                        let norm = crate::balancer::normalize_domain(&d);
-                        if !norm.is_empty() && cfproxy_429_cooldown_remaining_scoped(&norm, ProtoScope::Socks5) == Duration::ZERO {
-                            candidates.push(norm);
-                        }
-                    }
-                    for d in &domains {
-                        let norm = crate::balancer::normalize_domain(d);
-                        if !norm.is_empty() && !candidates.contains(&norm) && cfproxy_429_cooldown_remaining_scoped(&norm, ProtoScope::Socks5) == Duration::ZERO {
-                            candidates.push(norm);
-                        }
-                    }
-                    if candidates.is_empty() {
-                        candidates = crate::cfproxy::default_cfproxy_domains();
-                    }
 
-                    let domain_base = candidates[rand::random::<usize>() % candidates.len()].clone();
                     let target_host = format!("kws{}.{}", effective_dc, domain_base);
-                    let (ws, _, _) = cf_connect_domain_with_category(
+                    let (ws, _, err_opt) = cf_connect_domain_with_category(
                         &target_host,
                         "/apiws",
                         None,
@@ -1029,6 +1050,17 @@ pub fn trigger_warm_socks5_refill(user_domain: String, dc: i32, is_media: bool, 
                         Some(&cancel),
                     )
                     .await;
+                    if per_dc {
+                        if ws.is_some() {
+                            crate::balancer::BALANCER
+                                .write()
+                                .ensure_active_domain_if_unset(effective_dc, is_media, &domain_base);
+                        } else if let Some(e) = err_opt {
+                            if crate::ws::is_cooldown_error(&e) {
+                                mark_cfproxy_429_cooldown_scoped(&target_host, ProtoScope::Socks5, &e);
+                            }
+                        }
+                    }
                     (ws, domain_base)
                 } else {
                     let worker_dst = canonical_ipv4_for_dc(dc);

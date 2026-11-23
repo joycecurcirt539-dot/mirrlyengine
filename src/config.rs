@@ -353,6 +353,278 @@ pub static CFPROXY: Lazy<RwLock<CfproxyConfig>> = Lazy::new(|| {
 pub static CFPROXY_429: Lazy<RwLock<HashMap<String, Cfproxy429State>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
+// Flowseal Anycast CDN per-DC routing configuration (independent of Cloudflare Worker `user_domain`).
+pub static FLOWSEAL_PER_DC_ENABLED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FlowsealDcRouteKey {
+    pub dc_id: i32,
+    /// `None` applies to both chat and media on `dc_id`; `Some(false)` = chat only; `Some(true)` = media only.
+    pub is_media: Option<bool>,
+}
+
+pub static FLOWSEAL_DC_DOMAINS: Lazy<RwLock<HashMap<FlowsealDcRouteKey, String>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+#[inline]
+pub fn is_flowseal_per_dc_enabled() -> bool {
+    FLOWSEAL_PER_DC_ENABLED.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn set_flowseal_per_dc_enabled(enabled: bool) {
+    FLOWSEAL_PER_DC_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn normalize_flowseal_dc_domain(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('.');
+    if trimmed.is_empty() || trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return String::new();
+    }
+    let stripped = crate::balancer::normalize_domain(trimmed)
+        .trim_end_matches('.')
+        .to_string();
+    if stripped.is_empty() {
+        return String::new();
+    }
+    if crate::cfproxy::FLOWSEAL_OPEN_BASES.contains(&stripped.as_str()) {
+        return format!("{}.co.uk", stripped);
+    }
+    if !stripped.contains('.') {
+        return String::new();
+    }
+    stripped
+}
+
+pub fn set_flowseal_dc_domain(dc_id: i32, is_media: Option<bool>, raw_domain: &str) -> bool {
+    if !(1..=5).contains(&dc_id) {
+        return false;
+    }
+    let key = FlowsealDcRouteKey { dc_id, is_media };
+    if raw_domain.trim().is_empty() {
+        FLOWSEAL_DC_DOMAINS.write().remove(&key);
+        return true;
+    }
+    let normalized = normalize_flowseal_dc_domain(raw_domain);
+    if normalized.is_empty() {
+        return false;
+    }
+    FLOWSEAL_DC_DOMAINS.write().insert(key, normalized);
+    true
+}
+
+pub fn clear_flowseal_dc_domains() {
+    FLOWSEAL_DC_DOMAINS.write().clear();
+}
+
+pub fn get_flowseal_pinned_domain(dc_id: i32, is_media: bool) -> Option<String> {
+    let effective_dc = DC_OVERRIDES.get(&dc_id).copied().unwrap_or(dc_id);
+    let map = FLOWSEAL_DC_DOMAINS.read();
+    map.get(&FlowsealDcRouteKey {
+        dc_id: effective_dc,
+        is_media: Some(is_media),
+    })
+    .or_else(|| {
+        map.get(&FlowsealDcRouteKey {
+            dc_id: effective_dc,
+            is_media: None,
+        })
+    })
+    .cloned()
+}
+
+pub fn flowseal_pinned_domains_for_other_slots(
+    dc_id: i32,
+    is_media: bool,
+) -> std::collections::HashSet<String> {
+    let effective_dc = DC_OVERRIDES.get(&dc_id).copied().unwrap_or(dc_id);
+    let map = FLOWSEAL_DC_DOMAINS.read();
+    let own = map
+        .get(&FlowsealDcRouteKey {
+            dc_id: effective_dc,
+            is_media: Some(is_media),
+        })
+        .or_else(|| {
+            map.get(&FlowsealDcRouteKey {
+                dc_id: effective_dc,
+                is_media: None,
+            })
+        });
+    let mut reserved = std::collections::HashSet::new();
+    for dom in map.values() {
+        if own.map(|o| o.as_str()) != Some(dom.as_str()) {
+            reserved.insert(dom.clone());
+        }
+    }
+    reserved
+}
+
+pub fn snapshot_flowseal_dc_domains() -> Vec<(i32, Option<bool>, String)> {
+    let map = FLOWSEAL_DC_DOMAINS.read();
+    let mut entries: Vec<(FlowsealDcRouteKey, String)> =
+        map.iter().map(|(k, v)| (*k, v.clone())).collect();
+    entries.sort_by_key(|(k, _)| *k);
+    entries
+        .into_iter()
+        .map(|(k, v)| (k.dc_id, k.is_media, v))
+        .collect()
+}
+
+fn parse_flowseal_dc_map_key(raw_key: &str) -> Option<FlowsealDcRouteKey> {
+    let lower = raw_key.trim().to_ascii_lowercase();
+    let rest = lower.strip_prefix("dc").unwrap_or(&lower);
+    let (dc_part, is_media) = if let Some(prefix) = rest.strip_suffix("_media") {
+        (prefix, Some(true))
+    } else if let Some(prefix) = rest.strip_suffix("-media") {
+        (prefix, Some(true))
+    } else if let Some(prefix) = rest.strip_suffix(":media") {
+        (prefix, Some(true))
+    } else if let Some(prefix) = rest.strip_suffix("_chat") {
+        (prefix, Some(false))
+    } else if let Some(prefix) = rest.strip_suffix("-chat") {
+        (prefix, Some(false))
+    } else if let Some(prefix) = rest.strip_suffix(":chat") {
+        (prefix, Some(false))
+    } else if let Some(prefix) = rest.strip_suffix('m') {
+        (prefix, Some(true))
+    } else if let Some(prefix) = rest.strip_suffix('c') {
+        (prefix, Some(false))
+    } else {
+        (rest, None)
+    };
+    let dc_id = dc_part.parse::<i32>().ok()?;
+    if !(1..=5).contains(&dc_id) {
+        return None;
+    }
+    Some(FlowsealDcRouteKey { dc_id, is_media })
+}
+
+fn parse_flowseal_route_entry(
+    val: &serde_json::Value,
+    out: &mut HashMap<FlowsealDcRouteKey, String>,
+) -> Result<(), String> {
+    let obj = val
+        .as_object()
+        .ok_or_else(|| "route entry must be an object".to_string())?;
+    let dc_val = obj
+        .get("dc_id")
+        .or_else(|| obj.get("dc"))
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| "route entry missing integer dc_id".to_string())?;
+    let dc_id = dc_val as i32;
+    if !(1..=5).contains(&dc_id) {
+        return Err(format!("dc_id out of range 1..=5: {}", dc_id));
+    }
+    let is_media = match obj.get("is_media").or_else(|| obj.get("media")) {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Bool(b)) => Some(*b),
+        Some(serde_json::Value::Number(n)) => match n.as_i64() {
+            Some(0) => Some(false),
+            Some(1) => Some(true),
+            Some(-1) => None,
+            _ => return Err("invalid numeric is_media (expected -1, 0, or 1)".to_string()),
+        },
+        _ => return Err("invalid is_media type".to_string()),
+    };
+    let domain_raw = obj
+        .get("domain")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "route entry missing string domain".to_string())?;
+    let key = FlowsealDcRouteKey { dc_id, is_media };
+    if domain_raw.trim().is_empty() {
+        out.remove(&key);
+        return Ok(());
+    }
+    let normalized = normalize_flowseal_dc_domain(domain_raw);
+    if normalized.is_empty() {
+        return Err(format!("invalid Flowseal domain: {}", domain_raw));
+    }
+    out.insert(key, normalized);
+    Ok(())
+}
+
+fn parse_flowseal_map_object(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    out: &mut HashMap<FlowsealDcRouteKey, String>,
+) -> Result<(), String> {
+    for (k, v) in obj {
+        let key = parse_flowseal_dc_map_key(k)
+            .ok_or_else(|| format!("invalid DC route key: {}", k))?;
+        let domain_raw = v
+            .as_str()
+            .ok_or_else(|| format!("domain for {} must be a string", k))?;
+        if domain_raw.trim().is_empty() {
+            out.remove(&key);
+            continue;
+        }
+        let normalized = normalize_flowseal_dc_domain(domain_raw);
+        if normalized.is_empty() {
+            return Err(format!("invalid Flowseal domain for {}: {}", k, domain_raw));
+        }
+        out.insert(key, normalized);
+    }
+    Ok(())
+}
+
+/// Atomically parses and applies Flowseal per-DC routing configuration from JSON.
+/// Supported formats:
+/// - `{"enabled": true, "routes": [{"dc_id": 2, "is_media": true, "domain": "offshor.co.uk"}]}`
+/// - `{"enabled": true, "domains": {"dc2": "pclead.co.uk", "dc4_media": "cakeisalie.co.uk"}}`
+/// - `{"dc2": "pclead.co.uk", "4m": "cakeisalie.co.uk"}`
+/// - `[{"dc_id": 4, "is_media": true, "domain": "cakeisalie.co.uk"}]`
+pub fn set_flowseal_dc_domains_from_json(raw_json: &str) -> Result<usize, String> {
+    let val: serde_json::Value =
+        serde_json::from_str(raw_json).map_err(|e| format!("invalid JSON: {}", e))?;
+    let mut parsed_routes: HashMap<FlowsealDcRouteKey, String> = HashMap::new();
+    let mut parsed_enabled: Option<bool> = None;
+
+    match &val {
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                parse_flowseal_route_entry(item, &mut parsed_routes)?;
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            if let Some(en) = obj.get("enabled") {
+                parsed_enabled = Some(
+                    en.as_bool()
+                        .ok_or_else(|| "`enabled` field must be boolean".to_string())?,
+                );
+            }
+            if let Some(routes_val) = obj.get("routes") {
+                let arr = routes_val
+                    .as_array()
+                    .ok_or_else(|| "`routes` field must be an array".to_string())?;
+                for item in arr {
+                    parse_flowseal_route_entry(item, &mut parsed_routes)?;
+                }
+            } else if let Some(domains_val) = obj.get("domains") {
+                let map = domains_val
+                    .as_object()
+                    .ok_or_else(|| "`domains` field must be an object".to_string())?;
+                parse_flowseal_map_object(map, &mut parsed_routes)?;
+            } else {
+                let mut direct_map = serde_json::Map::new();
+                for (k, v) in obj {
+                    if k == "enabled" {
+                        continue;
+                    }
+                    direct_map.insert(k.clone(), v.clone());
+                }
+                parse_flowseal_map_object(&direct_map, &mut parsed_routes)?;
+            }
+        }
+        _ => return Err("JSON root must be an object or array".to_string()),
+    }
+
+    let count = parsed_routes.len();
+    *FLOWSEAL_DC_DOMAINS.write() = parsed_routes;
+    if let Some(en) = parsed_enabled {
+        set_flowseal_per_dc_enabled(en);
+    }
+    Ok(count)
+}
+
 pub const CFPROXY_DOMAINS_URL: &str =
     "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main/.github/cfproxy-domains.txt";
 
@@ -477,7 +749,21 @@ pub fn is_cloudflare_domain(domain: &str) -> bool {
     if !cfg.user_domain.is_empty() && crate::balancer::normalize_domain(&cfg.user_domain) == base {
         return true;
     }
-    cfg.domains.iter().any(|dom| crate::balancer::normalize_domain(dom) == base)
+    if cfg
+        .domains
+        .iter()
+        .any(|dom| crate::balancer::normalize_domain(dom) == base)
+    {
+        return true;
+    }
+    drop(cfg);
+    if !is_flowseal_per_dc_enabled() {
+        return false;
+    }
+    FLOWSEAL_DC_DOMAINS
+        .read()
+        .values()
+        .any(|dom| crate::balancer::normalize_domain(dom) == base)
 }
 
 
@@ -972,6 +1258,144 @@ mod secret_tests {
         assert!(!apply_proxy_secret_input("п1111111111111111111111111111111"));
         assert_eq!(*PROXY_SECRET.read(), "11111111111111111111111111111111");
         assert_eq!(get_faketls_domain(), DEFAULT_FAKETLS_DOMAIN);
+    }
+}
+
+#[cfg(test)]
+pub struct FlowsealPerDcTestGuard {
+    _lock: parking_lot::MutexGuard<'static, ()>,
+    prev_enabled: bool,
+    prev_map: HashMap<FlowsealDcRouteKey, String>,
+}
+
+#[cfg(test)]
+impl FlowsealPerDcTestGuard {
+    pub fn acquire() -> Self {
+        static LOCK: Lazy<parking_lot::Mutex<()>> = Lazy::new(|| parking_lot::Mutex::new(()));
+        let lock = LOCK.lock();
+        let prev_enabled = is_flowseal_per_dc_enabled();
+        let prev_map = FLOWSEAL_DC_DOMAINS.read().clone();
+        set_flowseal_per_dc_enabled(false);
+        clear_flowseal_dc_domains();
+        Self {
+            _lock: lock,
+            prev_enabled,
+            prev_map,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for FlowsealPerDcTestGuard {
+    fn drop(&mut self) {
+        set_flowseal_per_dc_enabled(self.prev_enabled);
+        *FLOWSEAL_DC_DOMAINS.write() = self.prev_map.clone();
+    }
+}
+
+#[cfg(test)]
+mod flowseal_per_dc_tests {
+    use super::*;
+
+    #[test]
+    fn normalize_flowseal_dc_domain_handles_open_bases_prefixes_and_custom_domains() {
+        assert_eq!(normalize_flowseal_dc_domain("pclead"), "pclead.co.uk");
+        assert_eq!(
+            normalize_flowseal_dc_domain("kws4.pclead.co.uk:443"),
+            "pclead.co.uk"
+        );
+        assert_eq!(
+            normalize_flowseal_dc_domain("https://kws2-1.offshor.co.uk/apiws"),
+            "offshor.co.uk"
+        );
+        // Custom .com domains must NOT be Caesar-mangled.
+        assert_eq!(
+            normalize_flowseal_dc_domain("custom-cdn.example.com"),
+            "custom-cdn.example.com"
+        );
+        assert_eq!(normalize_flowseal_dc_domain("149.154.167.51"), "");
+        assert_eq!(normalize_flowseal_dc_domain("invalidlabel"), "");
+        assert_eq!(normalize_flowseal_dc_domain("   "), "");
+    }
+
+    #[test]
+    fn per_dc_pin_precedence_and_json_formats() {
+        let _guard = FlowsealPerDcTestGuard::acquire();
+
+        assert!(set_flowseal_dc_domain(2, None, "pclead"));
+        assert!(set_flowseal_dc_domain(2, Some(true), "kws2.offshor.co.uk"));
+        assert!(!set_flowseal_dc_domain(0, None, "pclead"));
+        assert!(!set_flowseal_dc_domain(6, None, "pclead"));
+        assert!(!set_flowseal_dc_domain(4, Some(true), "1.2.3.4"));
+
+        // Exact (dc, is_media) beats general (dc, None); DC 203 resolves via DC_OVERRIDES -> DC 2.
+        assert_eq!(
+            get_flowseal_pinned_domain(2, false).as_deref(),
+            Some("pclead.co.uk")
+        );
+        assert_eq!(
+            get_flowseal_pinned_domain(2, true).as_deref(),
+            Some("offshor.co.uk")
+        );
+        assert_eq!(
+            get_flowseal_pinned_domain(203, false).as_deref(),
+            Some("pclead.co.uk")
+        );
+        assert_eq!(get_flowseal_pinned_domain(4, true), None);
+
+        // Reserved domains for DC4 include both DC2 pins.
+        let reserved_dc4 = flowseal_pinned_domains_for_other_slots(4, true);
+        assert!(reserved_dc4.contains("pclead.co.uk"));
+        assert!(reserved_dc4.contains("offshor.co.uk"));
+
+        // Batch JSON: routes array + enabled toggle.
+        let count = set_flowseal_dc_domains_from_json(
+            r#"{"enabled":true,"routes":[{"dc_id":2,"is_media":false,"domain":"pclead"},{"dc_id":4,"is_media":true,"domain":"cakeisalie.co.uk"}]}"#,
+        )
+        .expect("valid routes JSON");
+        assert_eq!(count, 2);
+        assert!(is_flowseal_per_dc_enabled());
+        assert_eq!(
+            get_flowseal_pinned_domain(2, false).as_deref(),
+            Some("pclead.co.uk")
+        );
+        assert_eq!(
+            get_flowseal_pinned_domain(4, true).as_deref(),
+            Some("cakeisalie.co.uk")
+        );
+        assert!(is_cloudflare_domain("kws4.cakeisalie.co.uk"));
+
+        // Batch JSON: direct map shorthand.
+        let count2 = set_flowseal_dc_domains_from_json(
+            r#"{"enabled":false,"dc1":"lovetrue","2m":"noskomnadzor.co.uk","dc4_media":"custom.cdn.example"}"#,
+        )
+        .expect("valid map JSON");
+        assert_eq!(count2, 3);
+        assert!(!is_flowseal_per_dc_enabled());
+        assert_eq!(
+            get_flowseal_pinned_domain(1, false).as_deref(),
+            Some("lovetrue.co.uk")
+        );
+        assert_eq!(
+            get_flowseal_pinned_domain(2, true).as_deref(),
+            Some("noskomnadzor.co.uk")
+        );
+        assert_eq!(
+            get_flowseal_pinned_domain(4, true).as_deref(),
+            Some("custom.cdn.example")
+        );
+        // Experimental setting is OFF: pinned custom domain must NOT affect Cloudflare domain checks.
+        assert!(!is_cloudflare_domain("kws4.custom.cdn.example"));
+        set_flowseal_per_dc_enabled(true);
+        assert!(is_cloudflare_domain("kws4.custom.cdn.example"));
+        set_flowseal_per_dc_enabled(false);
+
+        // Invalid JSON must NOT overwrite prior state.
+        assert!(set_flowseal_dc_domains_from_json(r#"{"dc9":"pclead.co.uk"}"#).is_err());
+        assert_eq!(
+            get_flowseal_pinned_domain(4, true).as_deref(),
+            Some("custom.cdn.example")
+        );
     }
 }
 

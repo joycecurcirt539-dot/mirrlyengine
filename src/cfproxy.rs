@@ -1256,6 +1256,186 @@ pub fn log_cf_conn_error(msg: &str, err: &WsError) {
     }
 }
 
+/// Unified Flowseal Anycast CDN candidate selector shared by MTProto (`WsPool` + Happy Eyeballs)
+/// and SOCKS5 (warm pool + Happy Eyeballs).
+///
+/// When `FLOWSEAL_PER_DC_ENABLED` is `true`, guarantees strict per-DC/per-slot exclusivity:
+/// 1. Uses only this slot's disjoint `exclusive_primary` bucket (explicit pin, active domain,
+///    or shard `idx % 10 == slot_idx`) while any non-429 domain in it is available.
+/// 2. Only borrows from `unoccupied_overflow` (never occupied by another slot) if `exclusive_primary`
+///    has no eligible non-429 domains, atomically claiming the borrowed domain(s) under `BALANCER.write()`
+///    so concurrent DCs cannot select the same CDN.
+/// 3. Falls back to `shared_fallback` ONLY when zero unoccupied non-429 domains exist anywhere.
+///
+/// Returns normalized base domains (without `kws{dc}.`) that are not currently in 429 cooldown.
+pub fn select_flowseal_candidates_for_dc(
+    dc: i32,
+    is_media: bool,
+    scope: ProtoScope,
+    max_race_candidates: Option<usize>,
+) -> Vec<String> {
+    let effective_dc = DC_OVERRIDES.get(&dc).copied().unwrap_or(dc);
+    let mut domains = CFPROXY.read().domains.clone();
+    if domains.is_empty() {
+        domains = default_cfproxy_domains();
+    }
+
+    if crate::config::is_flowseal_per_dc_enabled() {
+        if max_race_candidates == Some(0) {
+            return Vec::new();
+        }
+        let pinned = crate::config::get_flowseal_pinned_domain(effective_dc, is_media);
+        let reserved =
+            crate::config::flowseal_pinned_domains_for_other_slots(effective_dc, is_media);
+
+        // Hold BALANCER.write() across bucket computation + atomic in-flight claim so concurrent
+        // Tokio tasks for different DCs can never pick the same unoccupied domain.
+        let mut bal = crate::balancer::BALANCER.write();
+        let buckets = bal.get_domains_for_dc_isolated_buckets(
+            effective_dc,
+            is_media,
+            &domains,
+            pinned.as_deref(),
+            &reserved,
+        );
+
+        let filter_eligible = |list: Vec<String>| -> Vec<String> {
+            list.into_iter()
+                .filter(|d| {
+                    !d.is_empty()
+                        && cfproxy_429_cooldown_remaining_scoped(d, scope) == Duration::ZERO
+                })
+                .collect()
+        };
+
+        let excl_ok = filter_eligible(buckets.exclusive_primary);
+        if !excl_ok.is_empty() {
+            let chosen = match max_race_candidates {
+                Some(max_total) => excl_ok.into_iter().take(max_total).collect::<Vec<_>>(),
+                None => excl_ok,
+            };
+            // Warm pools dial `chosen[0]`; races dial all of `chosen`.
+            let claim_slice = if max_race_candidates.is_some() {
+                &chosen[..]
+            } else {
+                &chosen[..1]
+            };
+            bal.claim_in_flight_domains(effective_dc, is_media, claim_slice);
+            return chosen;
+        }
+
+        let overflow_ok = filter_eligible(buckets.unoccupied_overflow);
+        if !overflow_ok.is_empty() {
+            let borrow_cap = match max_race_candidates {
+                Some(max_total) => {
+                    let cap = if overflow_ok.len() > 3 { 2 } else { 1 };
+                    cap.min(max_total)
+                }
+                None => 1,
+            };
+            let chosen: Vec<String> = overflow_ok.into_iter().take(borrow_cap).collect();
+            bal.claim_in_flight_domains(effective_dc, is_media, &chosen);
+            return chosen;
+        }
+
+        // Last resort: zero unoccupied non-429 domains remain anywhere (e.g. tiny domain list).
+        // Do not overwrite another slot's ownership claims; just return shared fallback.
+        let shared_ok = filter_eligible(buckets.shared_fallback);
+        return match max_race_candidates {
+            Some(max_total) => shared_ok.into_iter().take(max_total).collect(),
+            None => shared_ok,
+        };
+    }
+
+    let mut ordered = crate::balancer::BALANCER
+        .read()
+        .get_domains_for_dc(effective_dc, is_media);
+    let mut seen: std::collections::HashSet<String> = ordered.iter().cloned().collect();
+    for d in &domains {
+        let norm = crate::balancer::normalize_domain(d);
+        if !norm.is_empty() && seen.insert(norm.clone()) {
+            ordered.push(norm);
+        }
+    }
+
+    let eligible: Vec<String> = ordered
+        .into_iter()
+        .filter(|d| {
+            !d.is_empty() && cfproxy_429_cooldown_remaining_scoped(d, scope) == Duration::ZERO
+        })
+        .collect();
+
+    let Some(max_total) = max_race_candidates else {
+        return eligible;
+    };
+    if eligible.is_empty() || max_total == 0 {
+        return Vec::new();
+    }
+
+    let mut selected = Vec::with_capacity(max_total.min(eligible.len()));
+    let mut selected_seen = std::collections::HashSet::new();
+    let diverse_ordered = crate::node_independence::NODE_INDEPENDENCE_TRACKER
+        .read()
+        .select_diverse_race_candidates(&eligible, 4);
+    for d in diverse_ordered {
+        if selected.len() >= max_total {
+            break;
+        }
+        if selected_seen.insert(d.clone()) {
+            selected.push(d);
+        }
+    }
+    for d in &eligible {
+        if selected.len() >= max_total {
+            break;
+        }
+        if selected_seen.insert(d.clone()) {
+            selected.push(d.clone());
+        }
+    }
+
+    selected
+}
+
+/// Builds a JSON snapshot of the Flowseal per-DC routing configuration, active DC assignments,
+/// and available base domains for host apps and diagnostics.
+pub fn build_flowseal_dc_config_json() -> String {
+    let enabled = crate::config::is_flowseal_per_dc_enabled();
+    let pinned_routes: Vec<serde_json::Value> = crate::config::snapshot_flowseal_dc_domains()
+        .into_iter()
+        .map(|(dc_id, is_media, domain)| {
+            serde_json::json!({
+                "dc_id": dc_id,
+                "is_media": is_media,
+                "domain": domain,
+            })
+        })
+        .collect();
+    let active_routes: Vec<serde_json::Value> = crate::balancer::BALANCER
+        .read()
+        .active_routes_snapshot()
+        .into_iter()
+        .map(|(dc_id, is_media, domain)| {
+            serde_json::json!({
+                "dc_id": dc_id,
+                "is_media": is_media,
+                "domain": domain,
+            })
+        })
+        .collect();
+    let mut available_domains = CFPROXY.read().domains.clone();
+    if available_domains.is_empty() {
+        available_domains = default_cfproxy_domains();
+    }
+    serde_json::json!({
+        "enabled": enabled,
+        "pinned_routes": pinned_routes,
+        "active_routes": active_routes,
+        "available_domains": available_domains,
+    })
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1472,5 +1652,239 @@ mod tests {
 
         let trunc = b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nshort";
         assert!(parse_http_text_response(trunc).is_err());
+    }
+
+    #[test]
+    fn test_select_flowseal_candidates_per_dc_pin_and_429_failover() {
+        let _guard = crate::config::FlowsealPerDcTestGuard::acquire();
+        clear_cfproxy_429_cooldowns();
+        crate::balancer::BALANCER.write().reset_ranking();
+
+        let pool_domains = vec![
+            "pclead.co.uk".to_string(),
+            "offshor.co.uk".to_string(),
+            "cakeisalie.co.uk".to_string(),
+            "noskomnadzor.co.uk".to_string(),
+            "lovetrue.co.uk".to_string(),
+        ];
+        CFPROXY.write().domains = pool_domains.clone();
+        crate::balancer::BALANCER
+            .write()
+            .update_domains_list(&pool_domains);
+
+        crate::config::set_flowseal_per_dc_enabled(true);
+        assert!(crate::config::set_flowseal_dc_domain(
+            4,
+            Some(true),
+            "cakeisalie.co.uk"
+        ));
+
+        // DC4 Media gets cakeisalie.co.uk at index 0 for both warm pool and Happy Eyeballs race.
+        let dc4_warm = select_flowseal_candidates_for_dc(4, true, ProtoScope::Socks5, None);
+        let dc4_race = select_flowseal_candidates_for_dc(4, true, ProtoScope::Socks5, Some(6));
+        assert_eq!(dc4_warm.first().map(String::as_str), Some("cakeisalie.co.uk"));
+        assert_eq!(dc4_race.first().map(String::as_str), Some("cakeisalie.co.uk"));
+
+        // DC2 Chat avoids DC4's pinned domain as its primary candidate.
+        let dc2_warm = select_flowseal_candidates_for_dc(2, false, ProtoScope::Socks5, None);
+        assert_ne!(dc2_warm.first().map(String::as_str), Some("cakeisalie.co.uk"));
+
+        // Putting cakeisalie.co.uk in SOCKS5 429 cooldown automatically fails DC4 Media over
+        // without affecting MTProto scope or DC2 Chat.
+        let err_429 = WsError::Handshake(crate::ws::WsHandshakeError {
+            status_code: 429,
+            status_line: "429 Too Many Requests".to_string(),
+            headers: std::collections::HashMap::new(),
+            location: String::new(),
+        });
+        mark_cfproxy_429_cooldown_scoped("kws4.cakeisalie.co.uk", ProtoScope::Socks5, &err_429);
+
+        let dc4_after_429 = select_flowseal_candidates_for_dc(4, true, ProtoScope::Socks5, Some(6));
+        assert!(!dc4_after_429.is_empty());
+        assert!(!dc4_after_429.contains(&"cakeisalie.co.uk".to_string()));
+
+        let dc4_mtproto = select_flowseal_candidates_for_dc(4, true, ProtoScope::Mtproto, Some(6));
+        assert_eq!(
+            dc4_mtproto.first().map(String::as_str),
+            Some("cakeisalie.co.uk")
+        );
+
+        clear_cfproxy_429_cooldowns();
+        crate::balancer::BALANCER.write().reset_ranking();
+    }
+
+    #[test]
+    fn test_select_flowseal_candidates_strict_disjoint_across_all_dcs_and_small_pools() {
+        let _guard = crate::config::FlowsealPerDcTestGuard::acquire();
+        clear_cfproxy_429_cooldowns();
+        crate::balancer::BALANCER.write().reset_ranking();
+
+        // 1. Default 20-domain Flowseal list: all 10 (dc_id, is_media) Happy Eyeballs race sets
+        //    must be 100% pairwise disjoint even on simultaneous cold start.
+        let twenty_domains: Vec<String> = (0..20).map(|i| format!("fs{:02}.co.uk", i)).collect();
+        CFPROXY.write().domains = twenty_domains.clone();
+        crate::balancer::BALANCER
+            .write()
+            .update_domains_list(&twenty_domains);
+        crate::config::set_flowseal_per_dc_enabled(true);
+
+        let mut seen_across_all_slots = std::collections::HashSet::new();
+        for dc in 1..=5 {
+            for is_media in [false, true] {
+                let race_set =
+                    select_flowseal_candidates_for_dc(dc, is_media, ProtoScope::Socks5, Some(6));
+                assert_eq!(
+                    race_set.len(),
+                    2,
+                    "DC{} media={} should own its 2 disjoint shard domains",
+                    dc,
+                    is_media
+                );
+                for dom in race_set {
+                    assert!(
+                        seen_across_all_slots.insert(dom.clone()),
+                        "collision detected: {} assigned to DC{} media={} while already claimed by another slot",
+                        dom,
+                        dc,
+                        is_media
+                    );
+                }
+            }
+        }
+        assert_eq!(seen_across_all_slots.len(), 20);
+
+        // 2. Tight 5-domain list across 5 active slots: atomic in-flight claims guarantee
+        //    5 distinct CDN domains with zero overlap even when slots exceed shard indices.
+        crate::balancer::BALANCER.write().reset_ranking();
+        let five_domains: Vec<String> = (0..5).map(|i| format!("tiny{}.co.uk", i)).collect();
+        CFPROXY.write().domains = five_domains.clone();
+        crate::balancer::BALANCER
+            .write()
+            .update_domains_list(&five_domains);
+
+        let five_slots = [(1, false), (2, false), (2, true), (4, true), (5, false)];
+        let mut seen_five = std::collections::HashSet::new();
+        for (dc, is_media) in five_slots {
+            let race_set =
+                select_flowseal_candidates_for_dc(dc, is_media, ProtoScope::Mtproto, Some(6));
+            assert_eq!(race_set.len(), 1);
+            assert!(
+                seen_five.insert(race_set[0].clone()),
+                "tight-pool collision on {} for DC{} media={}",
+                race_set[0],
+                dc,
+                is_media
+            );
+        }
+        assert_eq!(seen_five.len(), 5);
+
+        // 3. When a slot's own shard fails (consecutive_failures > 0), it borrows an unoccupied
+        //    domain from another unused shard without colliding with active/claimed slots.
+        crate::balancer::BALANCER.write().reset_ranking();
+        CFPROXY.write().domains = twenty_domains.clone();
+        crate::balancer::BALANCER
+            .write()
+            .update_domains_list(&twenty_domains);
+
+        let dc2_chat = select_flowseal_candidates_for_dc(2, false, ProtoScope::Socks5, Some(6));
+        let dc4_media_initial =
+            select_flowseal_candidates_for_dc(4, true, ProtoScope::Socks5, Some(6));
+        let gen = crate::balancer::BALANCER.read().current_generation();
+        for dom in &dc4_media_initial {
+            crate::balancer::BALANCER
+                .write()
+                .record_failure(gen, 4, true, dom);
+        }
+        let dc4_media_failover =
+            select_flowseal_candidates_for_dc(4, true, ProtoScope::Socks5, Some(6));
+        assert!(!dc4_media_failover.is_empty());
+        for dom in &dc4_media_failover {
+            assert!(
+                !dc2_chat.contains(dom),
+                "DC4 Media failover {} collided with DC2 Chat {:?}",
+                dom,
+                dc2_chat
+            );
+            assert!(
+                !dc4_media_initial.contains(dom),
+                "DC4 Media failover reused failed shard domain {}",
+                dom
+            );
+        }
+
+        // 4. Pool smaller than active slots (2 domains, 3 DCs): first 2 get distinct domains,
+        //    3rd safely falls back instead of returning empty.
+        crate::balancer::BALANCER.write().reset_ranking();
+        let two_domains = vec!["only1.co.uk".to_string(), "only2.co.uk".to_string()];
+        CFPROXY.write().domains = two_domains.clone();
+        crate::balancer::BALANCER
+            .write()
+            .update_domains_list(&two_domains);
+
+        let s1 = select_flowseal_candidates_for_dc(1, false, ProtoScope::Socks5, Some(6));
+        let s2 = select_flowseal_candidates_for_dc(2, false, ProtoScope::Socks5, Some(6));
+        let s3 = select_flowseal_candidates_for_dc(4, true, ProtoScope::Socks5, Some(6));
+        assert_eq!(s1.len(), 1);
+        assert_eq!(s2.len(), 1);
+        assert_ne!(s1[0], s2[0]);
+        assert!(!s3.is_empty(), "3rd DC must fall back instead of returning empty");
+
+        clear_cfproxy_429_cooldowns();
+        crate::balancer::BALANCER.write().reset_ranking();
+    }
+
+    #[test]
+    fn test_experimental_per_dc_toggle_off_preserves_legacy_behavior() {
+        let _guard = crate::config::FlowsealPerDcTestGuard::acquire();
+        clear_cfproxy_429_cooldowns();
+        crate::balancer::BALANCER.write().reset_ranking();
+
+        let domains = vec![
+            "pclead.co.uk".to_string(),
+            "offshor.co.uk".to_string(),
+            "cakeisalie.co.uk".to_string(),
+        ];
+        CFPROXY.write().domains = domains.clone();
+        crate::balancer::BALANCER
+            .write()
+            .update_domains_list(&domains);
+
+        // Experimental toggle is OFF by default.
+        assert!(!crate::config::is_flowseal_per_dc_enabled());
+
+        // Even if a pin is saved in config, it MUST NOT take effect while toggle is OFF.
+        assert!(crate::config::set_flowseal_dc_domain(
+            4,
+            Some(true),
+            "cakeisalie.co.uk"
+        ));
+
+        // Legacy behavior: DC2 and DC4 can both set and share the same active domain ("pclead.co.uk").
+        assert!(crate::balancer::BALANCER
+            .write()
+            .update_domain_for_dc(2, false, "pclead.co.uk"));
+        assert!(crate::balancer::BALANCER
+            .write()
+            .update_domain_for_dc(4, true, "pclead.co.uk"));
+        assert_eq!(
+            crate::balancer::BALANCER
+                .read()
+                .get_active_domain_for_dc(4, true)
+                .as_deref(),
+            Some("pclead.co.uk")
+        );
+
+        // Selector with toggle OFF ignores DC4 pin ("cakeisalie.co.uk") and leads with legacy active domain.
+        let dc4_off = select_flowseal_candidates_for_dc(4, true, ProtoScope::Socks5, Some(6));
+        assert_eq!(dc4_off.first().map(String::as_str), Some("pclead.co.uk"));
+
+        // Turning the experimental toggle ON immediately activates pin & isolation.
+        crate::config::set_flowseal_per_dc_enabled(true);
+        let dc4_on = select_flowseal_candidates_for_dc(4, true, ProtoScope::Socks5, Some(6));
+        assert_eq!(dc4_on.first().map(String::as_str), Some("cakeisalie.co.uk"));
+        assert!(!dc4_on.contains(&"pclead.co.uk".to_string()));
+
+        clear_cfproxy_429_cooldowns();
+        crate::balancer::BALANCER.write().reset_ranking();
     }
 }

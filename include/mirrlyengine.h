@@ -136,6 +136,23 @@ void SetCfProxyCacheDir(const char* cache_dir);
 void SetCfProxyConfig(int enabled, const char* user_domain);
 int PromoteCfproxyDomainForDc(int dc_id, int is_media, const char* domain);
 
+void SetFlowsealPerDcEnabled(int enabled);
+int IsFlowsealPerDcEnabled(void);
+/**
+ * Pins or clears (empty/NULL domain) a Flowseal Anycast base domain for a Telegram DC.
+ * `dc_id`: 1..5. `is_media`: 0 = chat, 1 = media, -1 = all traffic for that DC.
+ * Returns 1 on success, 0 on invalid arguments.
+ */
+int SetFlowsealDcDomain(int dc_id, int is_media, const char* domain);
+/**
+ * Batch-configures Flowseal per-DC routing from JSON.
+ * Returns 1 on success, 0 on parse/validation failure.
+ */
+int SetFlowsealDcDomainsJson(const char* json);
+void ClearFlowsealDcDomains(void);
+/** Caller must free returned string via FreeString(). */
+char* GetFlowsealDcConfigJson(void);
+
 void SetTlsEnabled(int enabled);
 int IsTlsEnabled(void);
 void SetTlsRecordPaddingEnabled(int enabled);

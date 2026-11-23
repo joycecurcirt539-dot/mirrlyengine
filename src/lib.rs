@@ -66,6 +66,7 @@ pub fn build_stats_json() -> String {
         "pool_misses": STATS.pool_misses.load(Ordering::Relaxed),
         "uptime_secs": engine_uptime_secs(),
         "tls_enabled": ws::is_tls_enabled(),
+        "flowseal_per_dc_enabled": config::is_flowseal_per_dc_enabled(),
         "mtproto_running": MTPROTO_RUNNING.load(Ordering::Acquire),
         "socks5_running": SOCKS5_RUNNING.load(Ordering::Acquire),
         "mtproto_port": MTPROTO_LISTEN_PORT.load(Ordering::Acquire),
@@ -945,6 +946,165 @@ pub unsafe extern "C" fn PromoteCfproxyDomainForDc(
     1
 }
 
+fn refresh_flowseal_pools_after_config_change() {
+    let pool_opt = mtproto_state_cell().lock().as_ref().map(|s| s.pool.clone());
+    if let Some(pool) = pool_opt {
+        let dc_opt = DC_OPT.read().clone();
+        let enabled = CFPROXY_ENABLED.load(Ordering::Relaxed);
+        let rt = runtime();
+        rt.spawn(async move {
+            pool.reset().await;
+            if enabled {
+                pool.prewarm(&dc_opt).await;
+            }
+        });
+    }
+
+    let socks5_cancel = socks5_state_cell()
+        .lock()
+        .as_ref()
+        .map(|s| s.cancel_tasks.clone());
+    if let Some(cancel) = socks5_cancel {
+        let user_domain = CFPROXY.read().user_domain.clone();
+        socks5::trigger_warm_socks5_pool_prime(user_domain, cancel);
+    }
+}
+
+/// Enables or disables isolated per-DC Flowseal Anycast CDN routing (shared by MTProto & SOCKS5).
+#[no_mangle]
+pub extern "C" fn SetFlowsealPerDcEnabled(enabled: c_int) {
+    let flag = enabled != 0;
+    generation_guard::change_config(|| {
+        config::set_flowseal_per_dc_enabled(flag);
+        balancer::BALANCER.write().clear_active_domains();
+        socks5::clear_socks5_warm_pool();
+    });
+    crate::linfo!("SetFlowsealPerDcEnabled: enabled={}", flag);
+    refresh_flowseal_pools_after_config_change();
+}
+
+#[no_mangle]
+pub extern "C" fn IsFlowsealPerDcEnabled() -> c_int {
+    if config::is_flowseal_per_dc_enabled() {
+        1
+    } else {
+        0
+    }
+}
+
+/// Pins (or clears when `domain` is empty/NULL) a Flowseal base domain for a Telegram DC.
+/// `dc_id`: 1..=5. `is_media`: 0 = chat, 1 = media, -1 = all traffic for that DC.
+/// Returns 1 on success, 0 on invalid arguments.
+#[no_mangle]
+pub unsafe extern "C" fn SetFlowsealDcDomain(
+    dc_id: c_int,
+    is_media: c_int,
+    c_domain: *const c_char,
+) -> c_int {
+    let media_opt = match is_media {
+        -1 => None,
+        0 => Some(false),
+        1 => Some(true),
+        _ => return 0,
+    };
+    let domain = cstr_to_string(c_domain);
+    let mut ok = false;
+    let mut should_refresh = false;
+    generation_guard::change_config(|| {
+        ok = config::set_flowseal_dc_domain(dc_id, media_opt, &domain);
+        if ok && config::is_flowseal_per_dc_enabled() {
+            balancer::BALANCER.write().clear_active_domains();
+            socks5::clear_socks5_warm_pool();
+            should_refresh = true;
+        }
+    });
+    if ok {
+        crate::linfo!(
+            "SetFlowsealDcDomain: dc={} is_media={:?} domain='{}' active={}",
+            dc_id,
+            media_opt,
+            domain.trim(),
+            should_refresh
+        );
+        if should_refresh {
+            refresh_flowseal_pools_after_config_change();
+        }
+        1
+    } else {
+        0
+    }
+}
+
+/// Batch-configures Flowseal per-DC routing from JSON.
+/// Returns 1 on success, 0 on parse/validation failure (leaving prior config intact).
+#[no_mangle]
+pub unsafe extern "C" fn SetFlowsealDcDomainsJson(c_json: *const c_char) -> c_int {
+    let raw_json = cstr_to_string(c_json);
+    if raw_json.trim().is_empty() {
+        return 0;
+    }
+    let mut result: Result<usize, String> = Err("uninitialized".to_string());
+    let mut should_refresh = false;
+    generation_guard::change_config(|| {
+        let was_enabled = config::is_flowseal_per_dc_enabled();
+        result = config::set_flowseal_dc_domains_from_json(&raw_json);
+        let now_enabled = config::is_flowseal_per_dc_enabled();
+        if result.is_ok() && (was_enabled || now_enabled) {
+            balancer::BALANCER.write().clear_active_domains();
+            socks5::clear_socks5_warm_pool();
+            should_refresh = true;
+        }
+    });
+    match result {
+        Ok(count) => {
+            crate::linfo!(
+                "SetFlowsealDcDomainsJson: applied {} pinned route(s), enabled={}",
+                count,
+                config::is_flowseal_per_dc_enabled()
+            );
+            if should_refresh {
+                refresh_flowseal_pools_after_config_change();
+            }
+            1
+        }
+        Err(err) => {
+            crate::lwarn!("SetFlowsealDcDomainsJson failed: {}", err);
+            0
+        }
+    }
+}
+
+/// Clears all manually pinned Flowseal per-DC domains (auto-isolation remains active if enabled).
+#[no_mangle]
+pub extern "C" fn ClearFlowsealDcDomains() {
+    let mut should_refresh = false;
+    generation_guard::change_config(|| {
+        config::clear_flowseal_dc_domains();
+        if config::is_flowseal_per_dc_enabled() {
+            balancer::BALANCER.write().clear_active_domains();
+            socks5::clear_socks5_warm_pool();
+            should_refresh = true;
+        }
+    });
+    crate::linfo!(
+        "ClearFlowsealDcDomains: cleared all pinned Flowseal per-DC routes (active={})",
+        should_refresh
+    );
+    if should_refresh {
+        refresh_flowseal_pools_after_config_change();
+    }
+}
+
+/// Returns JSON snapshot of Flowseal per-DC routing state, pinned routes, active routes,
+/// and available base domains. Caller must free returned string via `FreeString()`.
+#[no_mangle]
+pub extern "C" fn GetFlowsealDcConfigJson() -> *mut c_char {
+    let json = cfproxy::build_flowseal_dc_config_json();
+    CString::new(json)
+        .unwrap_or_else(|_| CString::new("{}").unwrap())
+        .into_raw()
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn SetSecret(c_secret: *const c_char) {
     let s = cstr_to_string(c_secret);
@@ -1083,6 +1243,7 @@ pub extern "C" fn GetUsefulRxSliJson() -> *mut c_char {
     let json = serde_json::json!({
         "transport": transport_name,
         "tls_enabled": tls_on,
+        "flowseal_per_dc_enabled": config::is_flowseal_per_dc_enabled(),
         "active_conns": active_conns,
         "connections_total": total_conns,
         "connections_ws": ws_total,
@@ -1480,6 +1641,82 @@ mod jni_bridge {
         ResetNetworkSockets();
     }
 
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeSetFlowsealPerDcEnabled(
+        _env: JNIEnv,
+        _class: JClass,
+        enabled: JBoolean,
+    ) {
+        SetFlowsealPerDcEnabled(if enabled != 0 { 1 } else { 0 });
+    }
+
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeIsFlowsealPerDcEnabled(
+        _env: JNIEnv,
+        _class: JClass,
+    ) -> JBoolean {
+        if IsFlowsealPerDcEnabled() != 0 {
+            1
+        } else {
+            0
+        }
+    }
+
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeSetFlowsealDcDomain(
+        env: JNIEnv,
+        _class: JClass,
+        dc_id: JInt,
+        is_media: JInt,
+        j_domain: JString,
+    ) -> JBoolean {
+        let domain = jni_get_string(env, j_domain);
+        let c_dom = match std::ffi::CString::new(domain) {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
+        if SetFlowsealDcDomain(dc_id, is_media, c_dom.as_ptr()) != 0 {
+            1
+        } else {
+            0
+        }
+    }
+
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeSetFlowsealDcDomainsJson(
+        env: JNIEnv,
+        _class: JClass,
+        j_json: JString,
+    ) -> JBoolean {
+        let raw_json = jni_get_string(env, j_json);
+        let c_json = match std::ffi::CString::new(raw_json) {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
+        if SetFlowsealDcDomainsJson(c_json.as_ptr()) != 0 {
+            1
+        } else {
+            0
+        }
+    }
+
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeClearFlowsealDcDomains(
+        _env: JNIEnv,
+        _class: JClass,
+    ) {
+        ClearFlowsealDcDomains();
+    }
+
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_org_telegram_messenger_mirrly_MirrlyEngineController_nativeGetFlowsealDcConfigJson(
+        env: JNIEnv,
+        _class: JClass,
+    ) -> JString {
+        let json = cfproxy::build_flowseal_dc_config_json();
+        jni_new_string(env, &json)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1535,5 +1772,62 @@ mod stats_json_tests {
         STATS.connections_active.store(0, Ordering::Relaxed);
         STATS.dec_connections_active();
         assert_eq!(STATS.connections_active.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+mod flowseal_ffi_tests {
+    use super::*;
+
+    #[test]
+    fn flowseal_per_dc_c_ffi_roundtrip() {
+        let _guard = crate::config::FlowsealPerDcTestGuard::acquire();
+
+        assert_eq!(IsFlowsealPerDcEnabled(), 0);
+        SetFlowsealPerDcEnabled(1);
+        assert_eq!(IsFlowsealPerDcEnabled(), 1);
+
+        let c_dom = CString::new("kws4.cakeisalie.co.uk").unwrap();
+        let rc = unsafe { SetFlowsealDcDomain(4, 1, c_dom.as_ptr()) };
+        assert_eq!(rc, 1);
+
+        let c_bad_media = CString::new("pclead.co.uk").unwrap();
+        assert_eq!(unsafe { SetFlowsealDcDomain(2, 9, c_bad_media.as_ptr()) }, 0);
+
+        let ptr = GetFlowsealDcConfigJson();
+        assert!(!ptr.is_null());
+        let json_str = unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() };
+        unsafe { FreeString(ptr) };
+
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("valid config JSON");
+        assert_eq!(parsed["enabled"], true);
+        let pinned = parsed["pinned_routes"].as_array().expect("pinned_routes array");
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0]["dc_id"], 4);
+        assert_eq!(pinned[0]["is_media"], true);
+        assert_eq!(pinned[0]["domain"], "cakeisalie.co.uk");
+        assert!(parsed["available_domains"].as_array().is_some());
+
+        let c_batch = CString::new(
+            r#"{"enabled":true,"domains":{"dc2":"pclead","dc4_media":"offshor.co.uk"}}"#,
+        )
+        .unwrap();
+        assert_eq!(unsafe { SetFlowsealDcDomainsJson(c_batch.as_ptr()) }, 1);
+        assert_eq!(
+            config::get_flowseal_pinned_domain(2, false).as_deref(),
+            Some("pclead.co.uk")
+        );
+        assert_eq!(
+            config::get_flowseal_pinned_domain(4, true).as_deref(),
+            Some("offshor.co.uk")
+        );
+
+        ClearFlowsealDcDomains();
+        assert_eq!(config::get_flowseal_pinned_domain(2, false), None);
+        assert_eq!(config::get_flowseal_pinned_domain(4, true), None);
+        assert_eq!(IsFlowsealPerDcEnabled(), 1);
+
+        SetFlowsealPerDcEnabled(0);
+        assert_eq!(IsFlowsealPerDcEnabled(), 0);
     }
 }

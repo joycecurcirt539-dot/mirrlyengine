@@ -526,22 +526,40 @@ impl WsPool {
                 });
             }
         } else {
-            let ordered = crate::balancer::BALANCER
-                .read()
-                .get_domains_for_dc(effective_dc, slot.is_media != 0);
-            let mut candidates = Vec::new();
-            for d in ordered {
-                if cfproxy_429_cooldown_remaining_scoped(&d, ProtoScope::Mtproto) == Duration::ZERO {
-                    candidates.push(d);
+            let is_media = slot.is_media != 0;
+            let per_dc = crate::config::is_flowseal_per_dc_enabled();
+            let candidates = if per_dc {
+                crate::cfproxy::select_flowseal_candidates_for_dc(
+                    effective_dc,
+                    is_media,
+                    ProtoScope::Mtproto,
+                    None,
+                )
+            } else {
+                let ordered = crate::balancer::BALANCER
+                    .read()
+                    .get_domains_for_dc(effective_dc, is_media);
+                let mut list = Vec::new();
+                for d in ordered {
+                    if cfproxy_429_cooldown_remaining_scoped(&d, ProtoScope::Mtproto)
+                        == Duration::ZERO
+                    {
+                        list.push(d);
+                    }
                 }
-            }
+                list
+            };
             if candidates.is_empty() {
                 state.dec_in_flight(needed);
                 return;
             }
 
             for i in 0..needed {
-                let domain_base = candidates[i % candidates.len()].clone();
+                let domain_base = if per_dc {
+                    candidates[0].clone()
+                } else {
+                    candidates[i % candidates.len()].clone()
+                };
                 let target_domain = format!("kws{}.{}", effective_dc, domain_base);
                 let path = "/apiws".to_string();
                 let cancel_h = cancel.clone();
@@ -566,6 +584,15 @@ impl WsPool {
                         ) => {
                             let (ws_opt, _ip, err_opt) = r;
                             if let Some(ws) = ws_opt {
+                                if per_dc {
+                                    crate::balancer::BALANCER
+                                        .write()
+                                        .ensure_active_domain_if_unset(
+                                            effective_dc,
+                                            is_media,
+                                            &domain_base,
+                                        );
+                                }
                                 Some((ws, target_domain))
                             } else {
                                 if let Some(e) = err_opt {
@@ -1168,7 +1195,17 @@ pub(crate) async fn cfproxy_acquire_raw_ws_race(
     // Parallel Anycast CDN targets (kws{effective_dc}.{domain}/apiws)
     let mut candidate_targets: Vec<(String, String)> = Vec::new();
 
-    if !domains.is_empty() {
+    if crate::config::is_flowseal_per_dc_enabled() {
+        candidate_targets = crate::cfproxy::select_flowseal_candidates_for_dc(
+            effective_dc,
+            is_media,
+            scope,
+            Some(6),
+        )
+        .into_iter()
+        .map(|d| (format!("kws{}.{}", effective_dc, d), "/apiws".to_string()))
+        .collect();
+    } else if !domains.is_empty() {
         let ordered = crate::balancer::BALANCER
             .read()
             .get_domains_for_dc(effective_dc, is_media);
@@ -1188,7 +1225,9 @@ pub(crate) async fn cfproxy_acquire_raw_ws_race(
             }
         }
         for d in &candidate_list {
-            if !diverse_ordered.contains(d) && cfproxy_429_cooldown_remaining_scoped(d, scope) == Duration::ZERO {
+            if !diverse_ordered.contains(d)
+                && cfproxy_429_cooldown_remaining_scoped(d, scope) == Duration::ZERO
+            {
                 let domain = format!("kws{}.{}", effective_dc, d);
                 candidate_targets.push((domain, "/apiws".to_string()));
                 if candidate_targets.len() >= 6 {
